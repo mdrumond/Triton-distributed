@@ -45,8 +45,9 @@ Triton-distributed是基于OpenAI Triton构建的分布式编译器，专为计�
 [安装指导](docs/build.md)
 
 ### 最近更新
-
-- 08/06/2025 ✨✨✨: 在 H800 上支持 GEMM+AllReduce 算子，以及在 L20 上支持 MoE TP 算子, 详情参见 [GEMM+AR Test](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/test/nvidia/test_gemm_ar.py) 和 [MOE Test](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/test/nvidia/test_moe_reduce_rs.py) .
+- 08/24/2025 ⚡⚡⚡：支持 [ByteDance-Seed/Seed-OSS-36B-Instruct](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct) 的推理加速，实现 1.33 倍加速。
+- 08/13/2025 ✨✨✨: MegaTritonKernel 实现，以及在 H20/H800 上提供 Qwen3 TP demo，详情参见 [MegaKernel Doc](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/docs/mega_triton_kernel.md)。
+- 08/06/2025 ✨✨✨: 在 H800 上支持 GEMM+AllReduce 算子，以及在 L20 上支持 MoE TP 算子, 详情参见 [GEMM+AR Test](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/test/nvidia/test_gemm_ar.py) 和 [MOE Test](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/test/nvidia/test_moe_reduce_rs.py)。
 - 07/24/2025 🤖🤖🤖：引入端到端推理加速 demo，统一支持 NVIDIA 和 AMD GPU。详情请参阅[文档](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/docs/getting-started/e2e/e2e_dense.md)。
 - 07/11/2025 ✨✨✨: 高性能AllReduce kernel实现。请见[AllReduce Test](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/test/nvidia/test_allreduce.py)。
 - 07/11/2025 ✨✨✨: 性能更优的TP MoE kernel。 请见 [AG+MoE Test](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/test/nvidia/test_ag_moe.py) 和 [MoE+RS Test](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/test/nvidia/test_moe_reduce_rs.py)。

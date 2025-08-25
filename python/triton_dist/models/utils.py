@@ -30,6 +30,8 @@ import logging
 import numpy as np
 import random
 import os
+from transformers import AutoModelForCausalLM, AutoConfig
+from accelerate import init_empty_weights
 
 if torch.version.cuda:
     PLATFORM = 'nvidia'
@@ -100,3 +102,27 @@ def sample_token(logits: torch.Tensor, temperature=0.6, top_p=0.95, top_k=-1):
                 "AMD platform does not support temperature sampling yet. Please use temperature=0.0 for argmax sampling."
             )
     return token
+
+
+@torch.no_grad()
+def init_model_cpu(model_name: str, dtype: torch.dtype):
+    with torch.no_grad():
+        random_params = os.environ.get("RANDOM_PARAMS", "0").lower() in ("1", "true", "yes")
+        if random_params:
+            print("Initializing model with random parameters. This may take a while...")
+            config = AutoConfig.from_pretrained(model_name)
+            with init_empty_weights():
+                model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype,
+                                                         attn_implementation="flash_attention_2")
+            model.to_empty(device="cuda")
+            model.init_weights()
+
+            return model
+
+        else:
+            print("Loading model from pre-trained weights. This may take a while...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=dtype,
+            )
+            return model
