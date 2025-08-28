@@ -16,8 +16,7 @@ Requirements:
 +++++++++++++
 - Python >=3.11 (suggest using virtual environment)
 - CUDA >=12.4
-- Torch >=2.4.1
-- Clang >=19
+- Torch >=2.8
 
 We recommend installation in `Nvidia PyTorch container <https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch/tags>`_.
 
@@ -56,19 +55,11 @@ Steps:
    .. code-block:: sh
 
       # If you are not using PyTorch container
-      pip3 install torch==2.4.1
+      pip3 install torch==2.8
       pip3 install cuda-python==12.4 # need to align with your nvcc version
-      pip3 install ninja cmake wheel pybind11 numpy chardet pytest
-      pip3 install pynvml>=11.5.3
+      pip3 install setuptools==69.0.0 wheel pybind11
 
-5. **Install NVSHMEM.**
-
-   .. code-block:: sh
-
-      pip3 install nvidia-nvshmem-cu12==3.3.9 cuda.core==0.2.0 "Cython>=0.29.24"
-      CPPFLAGS="-I/usr/local/cuda/include" pip3 install https://developer.download.nvidia.com/compute/nvshmem/redist/nvshmem_python/source/nvshmem_python-source-0.1.0.36132199_cuda12-archive.tar.xz
-
-6. **Build Triton-distributed**
+5. **Build Triton-distributed**
 
    Then you can build Triton-distributed.
 
@@ -80,26 +71,19 @@ Steps:
       # Install Triton-distributed
       cd /workspace/Triton-distributed
       export USE_TRITON_DISTRIBUTED_AOT=0
-      pip3 install -e python --verbose --no-build-isolation --use-pep517
+      echo 'numpy<2' > /tmp/pip_install_constraint.txt
+      MAX_JOBS=126 pip3 install -c /tmp/pip_install_constraint.txt -e python[build,tests,tutorials] --verbose --no-build-isolation --use-pep517
 
    We also provide AOT version of Triton-distributed. If you want to use AOT (**Not Recommended**), then
 
    .. code-block:: sh
 
       cd /workspace/Triton-distributed/
-      source scripts/setenv.sh
-      bash scripts/gen_aot_code.sh
+      bash ./scripts/gen_aot_code.sh
       export USE_TRITON_DISTRIBUTED_AOT=1
-      pip3 install -e python --verbose --no-build-isolation --use-pep517
+      MAX_JOBS=126 pip3 install -e python --verbose --no-build-isolation --use-pep517
 
    .. note:: You have to first build non-AOT version before building AOT version, once you build AOT version, you will always build for AOT in future. To unset this, you have to remove your build directory: `python/build`
-
-7. **Setup environment variables (Optional)**
-
-   .. code-block:: sh
-
-      cd /home/Triton-distributed
-      source scripts/setenv.sh
 
 +++++++++++++++++++++++
 Test your installation:

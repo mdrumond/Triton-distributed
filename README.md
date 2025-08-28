@@ -58,14 +58,10 @@ docker run --name triton-dist --ipc=host --network=host --privileged --cap-add=S
 docker exec -it triton-dist /bin/bash
 ```
 
-Install NVSHMEM
+Install Dependencies
 
 ```sh
-pip3 install pynvml>=11.5.3
-
-pip3 install nvidia-nvshmem-cu12==3.3.9 cuda.core==0.2.0 "Cython>=0.29.24"
-
-CPPFLAGS="-I/usr/local/cuda/include" pip3 install https://developer.download.nvidia.com/compute/nvshmem/redist/nvshmem_python/source/nvshmem_python-source-0.1.0.36132199_cuda12-archive.tar.xz
+pip3 install cuda-python==12.4 setuptools==69.0.0 wheel pybind11
 ```
 
 Then, pip install triton-dist.
@@ -75,12 +71,12 @@ pip uninstall triton
 pip uninstall triton_dist # remove previous triton-dist
 rm -rf /usr/local/lib/python3.12/dist-packages/triton
 # Install Triton-distributed
-pip install https://github.com/ByteDance-Seed/Triton-distributed/releases/download/experimental/triton_dist-3.4.0-cp312-cp312-linux_x86_64.whl
+pip install https://github.com/ByteDance-Seed/Triton-distributed/releases/download/v0.0.1-rc/triton_dist-3.4.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
 ```
 
 ### Latest News
 - 08/24/2025 ⚡⚡⚡: Support inference acceleration for [ByteDance-Seed/Seed-OSS-36B-Instruct](https://huggingface.co/ByteDance-Seed/Seed-OSS-36B-Instruct), achieving a 1.33x speedup.
-- 08/13/2025 ✨✨✨: Introduced the MegaTritonKernel and provided a Qwen3 TP demo on H20/H800, See the [doc](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/docs/mega_triton_kernel.md) for details.
+- 08/13/2025 ✨✨✨: Introduced the MegaTritonKernel and provided a Qwen3 TP demo on H20/H800, See the [doc](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/docs/getting-started/megakernel/megakernel.md) for details.
 - 08/06/2025 ✨✨✨: Support GEMM+AllReduce on H800 and support MoE operators on L20, see [GEMM+AR Test](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/test/nvidia/test_gemm_ar.py) and [MOE Test](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/test/nvidia/test_moe_reduce_rs.py) for detail.
 - 07/24/2025 🤖🤖🤖: Introduced end-to-end inference acceleration demo with unified support for both NVIDIA and AMD GPUs. See the [doc](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/docs/getting-started/e2e/e2e_dense.md) for details.
 - 07/11/2025 ✨✨✨: Fast AllReduce implemented with Triton-distributed, see [AllReduce Test](https://github.com/ByteDance-Seed/Triton-distributed/blob/main/python/triton_dist/test/nvidia/test_allreduce.py).
