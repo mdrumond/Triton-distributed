@@ -17,6 +17,7 @@ Getting Started
 - Follow the :doc:`installation instructions <getting-started/installation>` for your platform of choice.
 - Take a look at the :doc:`tutorials <getting-started/tutorials/index>` to learn how to write your first Triton-distributed program.
 - Explore our :doc:`end-to-end integration <getting-started/e2e/index>` to learn how Triton-Distributed accelerates inference for real-world LLMs.
+- Try our :doc:`megakernel implementations <getting-started/megakernel/index>` to learn how Triton-Distributed accelerates inference for real-world LLMs.
 
 .. toctree::
    :maxdepth: 10
