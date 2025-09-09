@@ -28,12 +28,13 @@ import os
 import gc
 import argparse
 from functools import partial
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig
 
+import pyrocshmem
 from triton_dist.models.kv_cache import KV_Cache
 from triton_dist.models.config import ModelConfig
 from triton_dist.models import AutoLLM
-from triton_dist.models.utils import seed_everything
+from triton_dist.models.utils import seed_everything, init_model_cpu
 from triton_dist.utils import perf_func, dist_print, group_profile
 
 THRESHOLD_MAP = {
@@ -120,6 +121,7 @@ if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
+    pyrocshmem.init_rocshmem_by_uniqueid(TP_GROUP)
     current_stream = torch.cuda.current_stream()
     torch.cuda.synchronize()
     DTYPE = DTYPE_MAP[args.dtype]
@@ -146,8 +148,8 @@ if __name__ == "__main__":
     if args.check:
         # Precision Test
         # golden
-        hf_model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=DTYPE,
-                                                        attn_implementation="flash_attention_2").cuda().eval()
+        config = AutoConfig.from_pretrained(args.model)
+        hf_model = init_model_cpu(args.model, DTYPE).cuda()
         with torch.inference_mode():
             golden = hf_model.forward(
                 input_ids=input_ids,
@@ -229,4 +231,5 @@ if __name__ == "__main__":
                    allowed_ranks=list(range(WORLD_SIZE)))
         del torch_graph, triton_dist_graph, mempool
 
+    pyrocshmem.rocshmem_finalize()
     torch.distributed.destroy_process_group()

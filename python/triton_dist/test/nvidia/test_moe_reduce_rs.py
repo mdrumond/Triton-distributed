@@ -31,7 +31,7 @@ from triton_dist.autotuner import contextual_autotune
 from triton_dist.kernels.nvidia import (create_moe_rs_context)
 from triton_dist.kernels.nvidia.comm_perf_model import estimate_reduce_scatter_time_ms, get_nic_gbps_per_gpu
 from triton_dist.kernels.nvidia.gemm_perf_model import get_dram_gbps, get_tensorcore_tflops
-from triton_dist.kernels.nvidia.moe_reduce_rs import run_moe_reduce_rs
+from triton_dist.kernels.nvidia.moe_reduce_rs import run_moe_reduce_rs, run_moe_reduce_rs_triton_non_overlap
 from triton_dist.utils import dist_print, finalize_distributed, get_intranode_max_speed, group_profile, perf_func, initialize_distributed, assert_allclose, sleep_async
 
 
@@ -195,6 +195,10 @@ if __name__ == "__main__":
         moe_reduce_rs.moe_gather_rs_grouped_gemm_kernel = triton.autotune(configs=configs, key=["M", "N", "K"])(
             moe_reduce_rs.moe_gather_rs_grouped_gemm_kernel)
         run_moe_reduce_rs = contextual_autotune(is_dist=True)(run_moe_reduce_rs)
+        moe_reduce_rs.moe_grouped_gemm_kernel = triton.autotune(configs=configs,
+                                                                key=["M", "N",
+                                                                     "K"])(moe_reduce_rs.moe_grouped_gemm_kernel)
+        run_moe_reduce_rs_triton_non_overlap = contextual_autotune(is_dist=True)(run_moe_reduce_rs_triton_non_overlap)
 
     tp_group = initialize_distributed(args.seed)
     RANK = tp_group.rank()
@@ -208,7 +212,7 @@ if __name__ == "__main__":
     num_experts = args.E
     topk = args.TOPK
 
-    max_token_num = 16 * 1024
+    max_token_num = ntokens * topk
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[args.dtype]
 
     iters = args.iters
@@ -241,16 +245,27 @@ if __name__ == "__main__":
     )
 
     func_torch = lambda: moe_reduce_rs_torch(intermediate_states, w, choosed_expert, expert_weight, tp_group)
+    func_triton_non_overlap = lambda: run_moe_reduce_rs_triton_non_overlap(intermediate_states, w, choosed_expert,
+                                                                           expert_weight)
     func_triton = lambda: module.forward(intermediate_states, w, choosed_expert, expert_weight)
+
     # runs
     output_torch = func_torch()
+    output_triton_non_overlap = func_triton_non_overlap()
     output_triton = func_triton()
+
     atol, rtol = THRESHOLD_MAP[dtype]
+    assert_allclose(output_triton_non_overlap, output_torch, atol=atol, rtol=rtol)
     assert_allclose(output_triton, output_torch, atol=atol, rtol=rtol)
 
     # don't care torch profile
     sleep_async(200)  # in case CPU bound
     torch_output, duration_ms_torch = perf_func(func_torch, iters=iters, warmup_iters=warmup_iters)
+
+    with group_profile(f"moe_rs_non_overlap_{os.environ['TORCHELASTIC_RUN_ID']}", do_prof=args.profile, group=tp_group):
+        sleep_async(100)
+        output, duration_ms_triton_non_overlap = perf_func(func_triton_non_overlap, iters=iters,
+                                                           warmup_iters=warmup_iters)
 
     with group_profile(f"moe_rs_{os.environ['TORCHELASTIC_RUN_ID']}", do_prof=args.profile, group=tp_group):
         sleep_async(100)  # in case CPU bound
@@ -258,6 +273,8 @@ if __name__ == "__main__":
 
     print_sol_time_estimate(args.M, args.K, args.N, args.E, args.TOPK, dtype, WORLD_SIZE, LOCAL_WORLD_SIZE)
     dist_print(f"dist-triton #{RANK} {duration_ms_triton:0.2f} ms/iter", need_sync=True,
+               allowed_ranks=list(range(WORLD_SIZE)))
+    dist_print(f"triton non-overlap #{RANK} {duration_ms_triton_non_overlap:0.2f} ms/iter", need_sync=True,
                allowed_ranks=list(range(WORLD_SIZE)))
     dist_print(f"torch #{RANK} {duration_ms_torch:0.2f} ms/iter", need_sync=True, allowed_ranks=list(range(WORLD_SIZE)))
 

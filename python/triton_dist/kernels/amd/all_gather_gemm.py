@@ -361,11 +361,9 @@ def create_ag_gemm_intra_node_context(max_M, N, K, input_dtype, output_dtype, ra
     M_per_rank = max_M // num_ranks
     assert M_per_rank % M_PER_CHUNK == 0
     dtype = input_dtype
-    m_chunk_num = (max_M + M_PER_CHUNK - 1) // M_PER_CHUNK
-
-
     workspaces = pyrocshmem.rocshmem_create_tensor_list_intra_node([max_M, K], dtype)
 
+    m_chunk_num = (max_M + M_PER_CHUNK - 1) // M_PER_CHUNK
     barriers = pyrocshmem.rocshmem_create_tensor_list_intra_node([m_chunk_num], torch.int32)
     barriers[rank].fill_(0)
 
@@ -375,7 +373,7 @@ def create_ag_gemm_intra_node_context(max_M, N, K, input_dtype, output_dtype, ra
                                 requires_grad=False)
 
     torch.cuda.synchronize()
-    
+
     _ag_streams = [torch.cuda.Stream(priority=-1) for i in range(num_ranks)] if ag_streams is None else ag_streams
     one = torch.ones((1024, ), dtype=torch.int32, device=torch.cuda.current_device())
     ret = AllGatherGEMMTensorParallelContext(

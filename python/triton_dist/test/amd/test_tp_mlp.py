@@ -28,11 +28,12 @@ import argparse
 import torch
 import torch.distributed
 from functools import partial
-from transformers import AutoModelForCausalLM
-import pyrocshmem
+from transformers import AutoConfig
 
+import pyrocshmem
 import triton
 from triton_dist.layers.amd.tp_mlp import TP_MLP
+from triton_dist.models.utils import init_model_cpu
 from triton_dist.utils import perf_func, dist_print, group_profile
 
 THRESHOLD_MAP = {
@@ -125,30 +126,15 @@ if __name__ == "__main__":
     torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
 
-    num_ranks = torch.distributed.get_world_size()
-    rank_id = torch.distributed.get_rank()
-
-    if rank_id==0:
-        uid = pyrocshmem.rocshmem_get_uniqueid()
-        bcast_obj = [uid]
-    else:
-        bcast_obj = [None]
-
-    torch.distributed.broadcast_object_list(bcast_obj, src=0)
-    torch.distributed.barrier()
-
-    pyrocshmem.rocshmem_init_attr(rank_id, num_ranks, bcast_obj[0])
-    
-    torch.cuda.synchronize()
-    torch.distributed.barrier()
-
+    pyrocshmem.init_rocshmem_by_uniqueid(TP_GROUP)
     current_stream = torch.cuda.current_stream()
     torch.cuda.synchronize()
     DTYPE = DTYPE_MAP[args.dtype]
     ATOL = THRESHOLD_MAP[DTYPE]
     RTOL = THRESHOLD_MAP[DTYPE]
 
-    hf_model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype=DTYPE)
+    config = AutoConfig.from_pretrained(args.model)
+    hf_model = init_model_cpu(model_name=args.model, dtype=DTYPE)
     hf_mlp = hf_model.model.layers[0].mlp.eval()
     mlp = TP_MLP(rank=RANK, world_size=WORLD_SIZE, group=TP_GROUP)
     mlp._init_parameters(hf_mlp, verbose=True)
