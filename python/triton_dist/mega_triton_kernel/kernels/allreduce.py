@@ -59,11 +59,10 @@ def allreduce_naive_intra_node_kernel(pid, num_pid, symm_in_ptr, out_ptr, elems,
         mask = idx < elems
         acc = tl.load(symm_in_ptr + idx, mask=mask, other=0.0).to(tl.float32)
         for peer in range(WORLD_SIZE):
-            if peer == RANK:
-                continue
-            remote_ptr = dl.symm_at(symm_in_ptr, peer)
-            peer_vals = tl.load(remote_ptr + idx, mask=mask, other=0.0).to(tl.float32)
-            acc += peer_vals
+            if peer != RANK:
+                remote_ptr = dl.symm_at(symm_in_ptr, peer)
+                peer_vals = tl.load(remote_ptr + idx, mask=mask, other=0.0).to(tl.float32)
+                acc += peer_vals
         tl.store(out_ptr + idx, acc.to(out_ptr.dtype.element_ty), mask=mask)
 
 
