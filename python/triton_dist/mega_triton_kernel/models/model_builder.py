@@ -91,8 +91,34 @@ class ModelBuilder:
         self._registry = registry
         self._code_generator = CodeGenerator()
         self._max_tensor_dim = MAX_NUM_TENSOR_DIMS
-        NUM_SMS = torch.cuda.get_device_properties("cuda").multi_processor_count
-        self.device_prop = DeviceProp(NUM_SMS=NUM_SMS)
+        device_index = torch.cuda.current_device()
+        device_props = torch.cuda.get_device_properties(device_index)
+        NUM_SMS = device_props.multi_processor_count
+        shared_mem_default = getattr(device_props, "shared_memory_per_block", 0)
+        shared_mem_optin = getattr(device_props, "shared_memory_per_block_optin", 0)
+        max_shared_mem = max(shared_mem_default, shared_mem_optin)
+        if max_shared_mem <= 0:
+            max_shared_mem = None
+
+        max_pipeline_stages_env = os.getenv("MEGAKERNEL_MAX_NUM_STAGES")
+        max_pipeline_stages = None
+        if max_pipeline_stages_env:
+            try:
+                parsed = int(max_pipeline_stages_env)
+                if parsed < 1:
+                    raise ValueError
+                max_pipeline_stages = parsed
+            except ValueError:
+                logger.log(
+                    f"Ignoring invalid MEGAKERNEL_MAX_NUM_STAGES={max_pipeline_stages_env}; expected positive integer.",
+                    level="warning",
+                )
+
+        self.device_prop = DeviceProp(
+            NUM_SMS=NUM_SMS,
+            MAX_SHARED_MEM_PER_BLOCK=max_shared_mem,
+            MAX_PIPELINE_STAGES=max_pipeline_stages,
+        )
         self.megakernel_tasks = []
         self.scoreboard = None
         self.wq_tensor = None  # work queue

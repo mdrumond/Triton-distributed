@@ -157,6 +157,55 @@ fc1_task_compute(task_base_info, scoreboard, BLOCK_SIZE_M={config.BLOCK_SIZE_M},
 class LinearTaskBuilder(TaskBuilderBase):
 
     @classmethod
+    def _adjust_num_stages(cls, kernel_config: LinearConfig, device_prop: 'DeviceProp',
+                           io_tensors: List[List['torch.Tensor']]) -> None:
+        if not hasattr(kernel_config, 'NUM_STAGES'):
+            return
+
+        original_num_stages = kernel_config.NUM_STAGES
+        max_stages = original_num_stages
+        clamp_reasons: List[str] = []
+
+        env_cap = getattr(device_prop, 'MAX_PIPELINE_STAGES', None)
+        if env_cap is not None:
+            if env_cap < 1:
+                env_cap = 1
+            if max_stages > env_cap:
+                clamp_reasons.append(f"env={env_cap}")
+                max_stages = env_cap
+
+        shared_mem_cap = getattr(device_prop, 'MAX_SHARED_MEM_PER_BLOCK', None)
+        if shared_mem_cap:
+            dtype_size = io_tensors[0][0].element_size()
+            tile_elements = kernel_config.BLOCK_SIZE_K * (
+                kernel_config.BLOCK_SIZE_M + kernel_config.BLOCK_SIZE_N)
+            tile_bytes = dtype_size * tile_elements
+            if tile_bytes <= 0:
+                raise ValueError("Computed non-positive shared memory usage for linear kernel tile")
+            if tile_bytes > shared_mem_cap:
+                raise RuntimeError(
+                    "Linear kernel tile requires "
+                    f"{tile_bytes} bytes of shared memory per stage but the device limit is {shared_mem_cap}. "
+                    "Reduce BLOCK_SIZE or choose a smaller configuration."
+                )
+            max_fit = shared_mem_cap // tile_bytes
+            if max_fit < 1:
+                max_fit = 1
+            if max_stages > max_fit:
+                clamp_reasons.append(f"smem={shared_mem_cap}B tile={tile_bytes}B")
+                max_stages = max_fit
+
+        if max_stages < 1:
+            max_stages = 1
+
+        if max_stages != original_num_stages:
+            reason_suffix = f" ({', '.join(clamp_reasons)})" if clamp_reasons else ""
+            cls.log(
+                f"Clamping NUM_STAGES from {original_num_stages} to {max_stages} for {cls.__name__}{reason_suffix}",
+                level="warning")
+            kernel_config.NUM_STAGES = max_stages
+
+    @classmethod
     def get_problem_size(cls, io_tensors: List[List['torch.Tensor']], extra_params: Dict[str, Any]):
         a, b = io_tensors[0]
         M, K = a.shape
@@ -168,6 +217,7 @@ class LinearTaskBuilder(TaskBuilderBase):
                           tile_wise=True, config_args={}) -> List[TaskBase]:
         assert tile_wise == True  # noqa: E712
         kernel_config = cls.create_config(**config_args)
+        cls._adjust_num_stages(kernel_config, device_prop, io_tensors)
         task_id = cls.get_task_id(layer_id)
         BLOCK_SIZE_M = kernel_config.BLOCK_SIZE_M
         BLOCK_SIZE_N = kernel_config.BLOCK_SIZE_N
