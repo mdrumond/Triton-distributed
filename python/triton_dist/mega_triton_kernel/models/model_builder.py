@@ -122,6 +122,7 @@ class ModelBuilder:
         self._enable_profiling = enable_profiling
         self._enable_dep_opt = enable_dep_opt
         self.task_types_to_str = None
+        self._warned_allreduce_fallback = False
         self._graph = Graph()
 
     def create_symm_tensor(self, shape, dtype) -> torch.Tensor:
@@ -470,18 +471,28 @@ class ModelBuilder:
             otherwise, the output may be wrong.
         """
         assert self.world_size > 1
-        if not is_multicast_ptr(input):
-            raise ValueError(
-                "The input tensor needs to be a symmetric buffer and AR is only supported in Hopper and later GPU architectures"
-            )
-        assert os.getenv("NVSHMEM_DISABLE_CUDA_VMM", "1") == "0"  # for multicast
+        use_multicast = is_multicast_ptr(input)
+        if use_multicast:
+            assert os.getenv("NVSHMEM_DISABLE_CUDA_VMM", "1") == "0"  # for multicast
+        else:
+            if not self._warned_allreduce_fallback:
+                self.logger.log(
+                    "NVSHMEM multicast pointers unavailable; falling back to symmetric-memory all-reduce.",
+                    level="warning",
+                )
+                self._warned_allreduce_fallback = True
         input = input.reshape(-1)
         output = output.reshape(-1)
         nbytes = input.numel() * input.element_size()
         assert nbytes % 128 == 0
         assert input.shape == output.shape and input.dtype == output.dtype
         self.make_barrier_all_intra_node(wait_inputs=[input], layer_id=layer_id)
-        self._convert_op("allreduce", layer_id, [[input], [output]])
+        extra_params = {
+            "use_multicast": use_multicast,
+            "rank": self.rank,
+            "world_size": self.world_size,
+        }
+        self._convert_op("allreduce", layer_id, [[input], [output]], extra_params)
         if not double_input_buffer:
             self.make_barrier_all_intra_node(wait_inputs=[output], layer_id=layer_id)
 

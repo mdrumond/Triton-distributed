@@ -35,6 +35,9 @@ from ..core.config import ConfigBase
 @dataclass
 class AllReduceConfig(ConfigBase):
     BLOCK_SIZE: int = 1024
+    USE_MULTICAST: bool = True
+    RANK: int = 0
+    WORLD_SIZE: int = 1
 
 
 @dataclass
@@ -50,7 +53,7 @@ def codegen_allreduce(task: AllReduceConfig) -> str:
     config: AllReduceConfig = task.config
 
     code = f"""
-allreduce_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE})
+allreduce_task_compute(task_base_info, scoreboard, BLOCK_SIZE={config.BLOCK_SIZE}, USE_MULTICAST={config.USE_MULTICAST}, RANK={config.RANK}, WORLD_SIZE={config.WORLD_SIZE})
 """
     return code
 
@@ -67,14 +70,17 @@ class AllReduceTaskBuilder(TaskBuilderBase):
         assert input.shape == output.shape and len(input.shape) == 1
         assert num_elements * output.element_size() % 128 == 0
         task_id = cls.get_task_id(layer_id)
-        kernel_config = cls.create_config()
+        use_multicast = extra_params.get("use_multicast", True)
+        rank = extra_params.get("rank", 0)
+        world_size = extra_params.get("world_size", 1)
+        kernel_config = cls.create_config(USE_MULTICAST=use_multicast, RANK=rank, WORLD_SIZE=world_size)
         num_tiles = cdiv(num_elements, kernel_config.BLOCK_SIZE)
 
         cls.log(
-            f"AllReduce Task: num_tiles = {num_tiles}, num_elements = {num_elements}, BLOCK_SIZE = {kernel_config.BLOCK_SIZE}, dependency = {dependency}"
+            f"AllReduce Task: num_tiles = {num_tiles}, num_elements = {num_elements}, BLOCK_SIZE = {kernel_config.BLOCK_SIZE}, dependency = {dependency}, use_multicast = {use_multicast}"
         )
         tasks = []
         for i in range(num_tiles):
             tasks.append(
-                cls._create_task(layer_id, task_id, i, num_tiles, kernel_config, dependency, io_tensors, extra_params))
+                cls._create_task(layer_id, task_id, i, num_tiles, kernel_config, dependency, io_tensors, {}))
         return tasks
