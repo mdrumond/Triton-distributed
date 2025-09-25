@@ -196,12 +196,20 @@ def main() -> None:
         generator=torch.Generator(device="cuda").manual_seed(args.seed + rank * 3),
     )
 
-    ctx = get_torch_prof_ctx(args.profile)
-    with ctx:
+    prof_ctx = get_torch_prof_ctx(args.profile)
+    with prof_ctx as prof:
         outputs = model.forward(inputs)
         torch.cuda.synchronize()
+        if prof is not None:
+            prof.step()
         if args.intra_kernel_profile:
             builder.dump_trace(trace_file_prefix=f"MEGA_KERNEL_TRACE_rank{rank}")
+
+    if args.profile and prof is not None:
+        prof_dir = "prof"
+        os.makedirs(prof_dir, exist_ok=True)
+        trace_path = os.path.join(prof_dir, f"fake_gated_mlp_rank{rank}.json.gz")
+        prof.export_chrome_trace(trace_path)
 
     ref_outputs = model.reference_forward(inputs).to(torch.float32)
     diff = (outputs.to(torch.float32) - ref_outputs).abs()
