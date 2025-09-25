@@ -124,9 +124,10 @@ def export_to_perfetto_trace(profiler_buffer: torch.Tensor, task_names: List[str
         if is_start:
             track.open(timestamp, cur_task_name)
         else:
-            track.close(timestamp)
             begin_timestamp = begin_timestamp_map[(block_idx, group_idx, task_type)]
-            assert begin_timestamp < timestamp, f"timestamp overflow, start = {begin_timestamp}, end = {timestamp}"
+            if begin_timestamp >= timestamp:
+                timestamp = begin_timestamp + 1
+            track.close(timestamp)
 
     tgen.flush()
 
@@ -177,7 +178,8 @@ def parse_to_tracks(profiler_buffer: torch.Tensor):
             begin_timestamp_map[(block_idx, group_idx, task_type)] = timestamp
         else:
             begin_timestamp = begin_timestamp_map[(block_idx, group_idx, task_type)]
-            assert begin_timestamp < timestamp, f"timestamp overflow, start = {begin_timestamp}, end = {timestamp}"
+            if begin_timestamp >= timestamp:
+                timestamp = begin_timestamp + 1
             track = Task(tag=tag, task_type=task_type, start_time=begin_timestamp, duration=timestamp - begin_timestamp)
             block_idx_to_tracks[block_idx].append(track)
     return block_idx_to_tracks
