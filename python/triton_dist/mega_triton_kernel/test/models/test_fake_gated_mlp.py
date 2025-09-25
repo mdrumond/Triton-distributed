@@ -210,7 +210,7 @@ def main() -> None:
         if prof is not None:
             prof.step()
         if args.intra_kernel_profile:
-            builder.dump_trace(trace_file_prefix=f"MEGA_KERNEL_TRACE_rank{rank}")
+            builder.dump_trace(trace_file_prefix="fake_gated_mlp")
 
     if args.profile and prof is not None:
         prof_dir = "prof"
