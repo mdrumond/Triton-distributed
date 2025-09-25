@@ -53,7 +53,13 @@ def alloc_profiler_buffer(max_num_profile_slots):
 
 
 def reset_profiler_buffer(buf):
-    buf.fill_(EMPTY_VALUE)
+    if buf.dtype == torch.uint64:
+        # Torch cannot fill a CUDA uint64 tensor with 0xFFFFFFFFFFFFFFFF directly
+        # because the python integer overflows the signed conversion path, so write
+        # the sentinel pattern via a signed view instead.
+        buf.view(torch.int64).fill_(-1)
+    else:
+        buf.fill_(-1)
     return buf
 
 
