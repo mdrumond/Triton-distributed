@@ -27,6 +27,7 @@ import triton.language as tl
 from triton.language.extra.cuda.language_extra import tid, __syncthreads
 from .task_context import TaskBaseInfo, Scoreboard
 from triton_dist.language.extra import libshmem_device
+import triton_dist.language as dl
 from triton.language.extra.cuda.language_extra import (st_v4_b32, multimem_ld_reduce_v4)
 from triton.language.extra.cuda.utils import num_warps
 
@@ -47,10 +48,32 @@ def allreduce_one_shot_multimem_intra_node_kernel(pid, num_pid, symm_in_ptr, out
 
 
 @triton.jit
+def allreduce_naive_intra_node_kernel(pid, num_pid, symm_in_ptr, out_ptr, elems, BLOCK_SIZE: tl.constexpr,
+                                      RANK: tl.constexpr, WORLD_SIZE: tl.constexpr):
+    symm_in_ptr = tl.cast(symm_in_ptr, out_ptr.dtype)
+    offsets = tl.arange(0, BLOCK_SIZE)
+    start = pid * BLOCK_SIZE
+    stride = num_pid * BLOCK_SIZE
+    for base in range(start, elems, stride):
+        idx = base + offsets
+        mask = idx < elems
+        acc = tl.load(symm_in_ptr + idx, mask=mask, other=0.0).to(tl.float32)
+        for peer in range(WORLD_SIZE):
+            if peer != RANK:
+                remote_ptr = dl.symm_at(symm_in_ptr, peer)
+                peer_vals = tl.load(remote_ptr + idx, mask=mask, other=0.0).to(tl.float32)
+                acc += peer_vals
+        tl.store(out_ptr + idx, acc.to(out_ptr.dtype.element_ty), mask=mask)
+
+
+@triton.jit
 def allreduce_task_compute(
     task_base_info: TaskBaseInfo,
     scoreboard: Scoreboard,
     BLOCK_SIZE: tl.constexpr,
+    USE_MULTICAST: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
 ):
     input_tensor = task_base_info.get_tensor(0)
     output_tensor = task_base_info.get_tensor(1)
@@ -61,5 +84,17 @@ def allreduce_task_compute(
     n_elements = output_tensor.size(0)
     tile_id = task_base_info.tile_id_or_start
     num_pid = tl.cdiv(n_elements, BLOCK_SIZE)
-    allreduce_one_shot_multimem_intra_node_kernel(tile_id, num_pid, input_ptr, output_ptr, n_elements)
+    if USE_MULTICAST:
+        allreduce_one_shot_multimem_intra_node_kernel(tile_id, num_pid, input_ptr, output_ptr, n_elements)
+    else:
+        allreduce_naive_intra_node_kernel(
+            tile_id,
+            num_pid,
+            input_ptr,
+            output_ptr,
+            n_elements,
+            BLOCK_SIZE=BLOCK_SIZE,
+            RANK=RANK,
+            WORLD_SIZE=WORLD_SIZE,
+        )
     scoreboard.release_tile(task_base_info, task_base_info.tile_id_or_start)

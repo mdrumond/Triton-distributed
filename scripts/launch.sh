@@ -72,6 +72,8 @@ function check_nvshmem_bootstrap_uid_sock() {
   local WARN_ICON='⚠️'
 
   local HAS_IPV4=0
+  local HAS_IPV6=0
+  local TARGET_FAMILY=""
 
   # check NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME: better matches the NCCL
   if [ -n "${NCCL_SOCKET_IFNAME}" ]; then
@@ -89,15 +91,33 @@ function check_nvshmem_bootstrap_uid_sock() {
     fi
   fi
 
-  if [ -n "${NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY}" ]; then
-    if command -v ip >/dev/null 2>&1; then
-      ip -4 addr show dev "${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME}" 2>/dev/null | grep -q 'inet' && HAS_IPV4=1
-    fi
+  if command -v ip >/dev/null 2>&1 && [ -n "${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME}" ]; then
+    ip -4 addr show dev "${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME}" 2>/dev/null | grep -q 'inet ' && HAS_IPV4=1
+    ip -6 addr show dev "${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME}" 2>/dev/null | grep -q 'inet6 ' && HAS_IPV6=1
   fi
 
-  if [ ${HAS_IPV4} -eq 0 ]; then
-    echo -e "${YELLOW}${BOLD}${WARN_ICON} WARNING: ${RESET}${BOLD}${RESET} NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY=${NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY} does not support IPv4, force set NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY to AF_INET6..."
-    export NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY=AF_INET6
+  if [ ${HAS_IPV4} -eq 1 ]; then
+    TARGET_FAMILY=AF_INET
+  elif [ ${HAS_IPV6} -eq 1 ]; then
+    TARGET_FAMILY=AF_INET6
+  fi
+
+  if [ -n "${TARGET_FAMILY}" ]; then
+    if [ "${NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY}" != "${TARGET_FAMILY}" ]; then
+      echo -e "${YELLOW}${BOLD}${WARN_ICON} WARNING: ${RESET}${BOLD}${RESET} NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY=${NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY} does not match detected address family (${TARGET_FAMILY}), forcing NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY=${TARGET_FAMILY}..."
+      export NVSHMEM_BOOTSTRAP_UID_SOCK_FAMILY=${TARGET_FAMILY}
+    fi
+
+    if [ "${NCCL_SOCKET_FAMILY}" != "${TARGET_FAMILY}" ]; then
+      if [ -n "${NCCL_SOCKET_FAMILY}" ]; then
+        echo -e "${YELLOW}${BOLD}${WARN_ICON} WARNING: ${RESET}${BOLD}${RESET} NCCL_SOCKET_FAMILY=${NCCL_SOCKET_FAMILY} does not match detected address family (${TARGET_FAMILY}), forcing NCCL_SOCKET_FAMILY=${TARGET_FAMILY}..."
+      else
+        echo "Setting NCCL_SOCKET_FAMILY=${TARGET_FAMILY} to match ${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME}"
+      fi
+      export NCCL_SOCKET_FAMILY=${TARGET_FAMILY}
+    fi
+  else
+    echo -e "${YELLOW}${BOLD}${WARN_ICON} WARNING: ${RESET}${BOLD}${RESET} Could not detect an IPv4 or IPv6 address on interface ${NVSHMEM_BOOTSTRAP_UID_SOCK_IFNAME}."
   fi
 }
 

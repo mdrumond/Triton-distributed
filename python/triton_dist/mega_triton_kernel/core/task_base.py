@@ -22,7 +22,7 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-from typing import Dict, Type, List, Any, Tuple, Union
+from typing import Dict, Type, List, Any, Tuple, Union, Optional
 from dataclasses import dataclass, field
 from .config import ConfigBase
 import torch
@@ -258,3 +258,5 @@ class TaskBase:
 @dataclass
 class DeviceProp:
     NUM_SMS: int
+    MAX_SHARED_MEM_PER_BLOCK: Optional[int] = None
+    MAX_PIPELINE_STAGES: Optional[int] = None
