@@ -26,13 +26,17 @@
 
 This script builds a synthetic model composed of five linear layers followed by a
 SiLU activation-and-multiply stage.  It exercises the MegaKernel compiler with a
-configuration that requires multiple execution tiles while staying well within
-the memory budget of two 24GB GPUs.  The goal is to provide a concise example
-that can be profiled with both the torch profiler (``--profile``) and the
-MegaKernel intra-kernel profiler (``--intra-kernel-profile``).
+configuration that spans multiple execution tiles while staying well within the
+memory budget of two 24GB GPUs.  With the default ``batch=512`` and
+``hidden=1024`` dimensions, each linear launch covers thousands of tiles,
+making the example fast to compile but still representative.  The goal is to
+provide a concise example that can be profiled with both the torch profiler
+(``--profile``) and the MegaKernel intra-kernel profiler
+(``--intra-kernel-profile``).
 """
 
 import argparse
+import math
 import os
 from dataclasses import dataclass
 from typing import List
@@ -57,8 +61,8 @@ DTYPE_MAP = {
 
 @dataclass
 class FakeGatedMLPConfig:
-    batch_size: int = 2048
-    hidden_size: int = 4096
+    batch_size: int = 512
+    hidden_size: int = 1024
     num_layers: int = 5
     dtype: torch.dtype = torch.bfloat16
 
@@ -132,8 +136,8 @@ class FakeGatedMLP:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", default="bfloat16", choices=DTYPE_MAP.keys())
-    parser.add_argument("--batch-size", type=int, default=2048)
-    parser.add_argument("--hidden-size", type=int, default=4096)
+    parser.add_argument("--batch-size", type=int, default=512)
+    parser.add_argument("--hidden-size", type=int, default=1024)
     parser.add_argument("--num-layers", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--profile", action="store_true", help="Enable torch profiler")
@@ -160,6 +164,16 @@ def main() -> None:
         num_layers=args.num_layers,
         dtype=dtype,
     )
+
+    if rank == 0:
+        # The current linear/activation kernels use 16x16 tile shapes, so report how many
+        # tiles each layer will cover to help spot configurations that may compile slowly.
+        tiles_linear = math.ceil(config.batch_size / 16) * math.ceil((config.hidden_size * 2) / 16)
+        tiles_silu = math.ceil(config.batch_size / 16) * math.ceil(config.hidden_size / 16)
+        print(
+            "Estimated tiles per layer -- linear: "
+            f"{tiles_linear:,}, silu: {tiles_silu:,}"
+        )
 
     def alloc_fn(size, alignment, stream):
         return torch.empty(size, device="cuda", dtype=torch.int8)
