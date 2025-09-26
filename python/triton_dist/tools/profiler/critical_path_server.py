@@ -397,16 +397,26 @@ class DependencyTraceService:
             return None
         if os.path.isabs(filename) and os.path.exists(filename):
             return os.path.abspath(filename)
-        candidates: List[str] = []
-        base_dir = self.metadata.get("origin_base_dir")
-        if base_dir:
-            candidates.append(os.path.join(base_dir, filename))
+
+        candidates: List[Path] = []
+
+        env_root = os.environ.get("TRITON_DISTRIBUTED_SOURCE_ROOT")
+        if env_root:
+            candidates.append(Path(env_root) / filename)
+
         if self._repo_root:
-            candidates.append(os.path.join(str(self._repo_root), filename))
-        candidates.append(os.path.join(self._trace_path.parent, filename))
+            candidates.append(self._repo_root / filename)
+
+        candidates.append(self._trace_path.parent / filename)
+        candidates.append(Path.cwd() / filename)
+
         for candidate in candidates:
-            if candidate and os.path.exists(candidate):
-                return os.path.abspath(candidate)
+            try:
+                resolved = candidate.resolve()
+            except (OSError, RuntimeError):
+                continue
+            if resolved.exists():
+                return str(resolved)
         return None
 
     def _source_info(self, filename: Optional[str], lineno: Optional[int], function: Optional[str], code_context: Optional[str]) -> Dict[str, Optional[str]]:
