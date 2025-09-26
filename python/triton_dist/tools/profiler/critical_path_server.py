@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import glob
 import json
 import linecache
 import os
@@ -21,8 +22,8 @@ import sys
 import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 # --------------------------------------------------------------------------------------
@@ -195,7 +196,7 @@ def initialise_database(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS tasks (
-            node_id TEXT PRIMARY KEY,
+            node_id TEXT,
             task_type TEXT,
             task_type_id INTEGER,
             layer_id INTEGER,
@@ -206,7 +207,8 @@ def initialise_database(conn: sqlite3.Connection) -> None:
             start_time_ns INTEGER,
             duration_ns INTEGER,
             finish_time_ns INTEGER,
-            absolute_start_time_ns INTEGER
+            absolute_start_time_ns INTEGER,
+            PRIMARY KEY (node_id, rank)
         )
         """
     )
@@ -244,10 +246,8 @@ def clear_database(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
-    initialise_database(conn)
-    clear_database(conn)
-    conn.execute("BEGIN")
+def _ingest_trace_file(trace_path: Path, conn: sqlite3.Connection) -> Dict[str, object]:
+    metadata: Dict[str, object] = {"trace_file": str(trace_path)}
     with trace_path.open("r", encoding="utf-8") as fp:
         _expect_char(fp, "{")
         while True:
@@ -272,7 +272,7 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
                             duration_ns,
                             finish_time_ns,
                             absolute_start_time_ns
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             obj.get("node_id"),
@@ -306,7 +306,7 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
                             origin_lineno,
                             origin_function,
                             origin_code_context
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             obj.get("src"),
@@ -322,38 +322,100 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
                         ),
                     ),
                 )
-            elif key == "min_start_time_ns":
-                value = _read_scalar(fp)
-                conn.execute(
-                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                    ("min_start_time_ns", json.dumps(value)),
-                )
-            elif key == "origin_base_dir":
-                value = _read_scalar(fp)
-                conn.execute(
-                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                    ("origin_base_dir", json.dumps(value)),
-                )
-            elif key == "rank":
-                value = _read_scalar(fp)
-                conn.execute(
-                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                    ("rank", json.dumps(value)),
-                )
-            elif key == "world_size":
-                value = _read_scalar(fp)
-                conn.execute(
-                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
-                    ("world_size", json.dumps(value)),
-                )
+            elif key in {
+                "min_start_time_ns",
+                "origin_base_dir",
+                "rank",
+                "world_size",
+            }:
+                metadata[key] = _read_scalar(fp)
             else:
-                _skip_value(fp)
+                metadata[key] = _read_scalar(fp)
             delim = _read_post_value_delimiter(fp)
             if delim == "}":
                 break
             if delim not in {",", None}:
                 raise ValueError(f"Unexpected delimiter {delim!r}")
-    conn.commit()
+    return metadata
+
+
+def ingest_traces(trace_paths: List[Path], conn: sqlite3.Connection) -> None:
+    if not trace_paths:
+        raise ValueError("No trace files provided")
+
+    initialise_database(conn)
+    clear_database(conn)
+
+    aggregated_min_start: Optional[int] = None
+    aggregated_ranks: List[int] = []
+    aggregated_world_sizes: List[int] = []
+    origin_base_dirs: Dict[str, str] = {}
+    trace_files: List[str] = []
+
+    conn.execute("BEGIN")
+    try:
+        for trace_path in trace_paths:
+            metadata = _ingest_trace_file(trace_path, conn)
+            trace_files.append(str(trace_path))
+
+            min_start = metadata.get("min_start_time_ns")
+            if isinstance(min_start, int):
+                if aggregated_min_start is None or min_start < aggregated_min_start:
+                    aggregated_min_start = min_start
+
+            rank_value = metadata.get("rank")
+            if isinstance(rank_value, int):
+                aggregated_ranks.append(rank_value)
+                origin_dir = metadata.get("origin_base_dir")
+                if isinstance(origin_dir, str):
+                    origin_base_dirs[str(rank_value)] = origin_dir
+
+            world_size_value = metadata.get("world_size")
+            if isinstance(world_size_value, int):
+                aggregated_world_sizes.append(world_size_value)
+
+            # Carry through a default origin directory if available without rank info.
+            if "origin_base_dir" in metadata and not origin_base_dirs.get("default"):
+                origin_dir_value = metadata.get("origin_base_dir")
+                if isinstance(origin_dir_value, str):
+                    origin_base_dirs["default"] = origin_dir_value
+
+        metadata_rows: List[Tuple[str, object]] = []
+        if aggregated_min_start is not None:
+            metadata_rows.append(("min_start_time_ns", aggregated_min_start))
+
+        if aggregated_ranks:
+            unique_ranks = sorted({int(r) for r in aggregated_ranks})
+            if len(unique_ranks) == 1:
+                metadata_rows.append(("rank", unique_ranks[0]))
+            metadata_rows.append(("ranks", unique_ranks))
+
+        if aggregated_world_sizes:
+            unique_world_sizes = sorted({int(w) for w in aggregated_world_sizes})
+            if len(unique_world_sizes) == 1:
+                metadata_rows.append(("world_size", unique_world_sizes[0]))
+            else:
+                metadata_rows.append(("world_sizes", unique_world_sizes))
+
+        if origin_base_dirs:
+            metadata_rows.append(("origin_base_dirs", origin_base_dirs))
+            unique_dirs = {value for value in origin_base_dirs.values() if isinstance(value, str)}
+            if len(unique_dirs) == 1:
+                metadata_rows.append(("origin_base_dir", next(iter(unique_dirs))))
+
+        if trace_files:
+            metadata_rows.append(("trace_files", trace_files))
+
+        for key, value in metadata_rows:
+            conn.execute(
+                "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                (key, json.dumps(value)),
+            )
+    except Exception:
+        conn.rollback()
+        raise
+    else:
+        conn.commit()
 
 
 # --------------------------------------------------------------------------------------
@@ -379,11 +441,26 @@ def _detect_repo_root(start_path: Optional[Path] = None) -> Optional[Path]:
 
 
 class DependencyTraceService:
-    def __init__(self, db_path: Path, trace_path: Path) -> None:
+    def __init__(self, db_path: Path, trace_paths: Sequence[Path]) -> None:
+        if not trace_paths:
+            raise ValueError("trace_paths must not be empty")
         self._db_path = db_path
-        self._trace_path = trace_path
-        self._metadata_cache: Optional[Dict[str, Optional[str]]] = None
-        self._repo_root = _detect_repo_root() or _detect_repo_root(trace_path.parent)
+        self._trace_paths = list(trace_paths)
+        self._trace_dirs = []
+        seen_dirs = set()
+        for path in self._trace_paths:
+            directory = path.parent
+            if directory not in seen_dirs:
+                self._trace_dirs.append(directory)
+                seen_dirs.add(directory)
+        self._metadata_cache: Optional[Dict[str, object]] = None
+        repo_root = _detect_repo_root()
+        if repo_root is None:
+            for directory in self._trace_dirs:
+                repo_root = _detect_repo_root(directory)
+                if repo_root is not None:
+                    break
+        self._repo_root = repo_root
 
     @contextlib.contextmanager
     def _connection(self):
@@ -394,10 +471,10 @@ class DependencyTraceService:
         finally:
             conn.close()
 
-    def _load_metadata(self) -> Dict[str, Optional[str]]:
+    def _load_metadata(self) -> Dict[str, object]:
         if self._metadata_cache is not None:
             return self._metadata_cache
-        data: Dict[str, Optional[str]] = {}
+        data: Dict[str, object] = {}
         with self._connection() as conn:
             cursor = conn.execute("SELECT key, value FROM metadata")
             for row in cursor.fetchall():
@@ -410,34 +487,61 @@ class DependencyTraceService:
         return data
 
     @property
-    def metadata(self) -> Dict[str, Optional[str]]:
+    def metadata(self) -> Dict[str, object]:
         return self._load_metadata()
 
-    def _resolve_source_path(self, filename: Optional[str]) -> Optional[str]:
+    def _resolve_source_path(self, filename: Optional[str], rank: Optional[int] = None) -> Optional[str]:
         if not filename:
             return None
-        if os.path.isabs(filename) and os.path.exists(filename):
-            return os.path.abspath(filename)
+        if os.path.isabs(filename):
+            try:
+                abs_path = Path(filename)
+            except TypeError:
+                return None
+            if abs_path.exists():
+                return str(abs_path.resolve())
 
-        candidates: List[Path] = []
+        candidate_dirs: List[Path] = []
+        metadata = self.metadata
+
+        base_dir = metadata.get("origin_base_dir")
+        if isinstance(base_dir, str):
+            candidate_dirs.append(Path(base_dir))
+
+        origin_base_dirs = metadata.get("origin_base_dirs")
+        if isinstance(origin_base_dirs, dict):
+            default_dir = origin_base_dirs.get("default")
+            if isinstance(default_dir, str):
+                candidate_dirs.append(Path(default_dir))
+            if rank is not None:
+                rank_key = str(rank)
+                rank_dir = origin_base_dirs.get(rank_key)
+                if rank_dir is None:
+                    rank_dir = origin_base_dirs.get(rank)
+                if isinstance(rank_dir, str):
+                    candidate_dirs.append(Path(rank_dir))
 
         if self._repo_root:
-            candidates.append(self._repo_root / filename)
+            candidate_dirs.append(self._repo_root)
 
-        candidates.append(self._trace_path.parent / filename)
-        candidates.append(Path.cwd() / filename)
+        candidate_dirs.extend(self._trace_dirs)
+        candidate_dirs.append(Path.cwd())
 
-        for candidate in candidates:
+        tried: Set[Path] = set()
+        for directory in candidate_dirs:
             try:
-                resolved = candidate.resolve()
+                candidate = (directory / filename).resolve()
             except (OSError, RuntimeError):
                 continue
-            if resolved.exists():
-                return str(resolved)
+            if candidate in tried:
+                continue
+            tried.add(candidate)
+            if candidate.exists():
+                return str(candidate)
         return None
 
-    def _source_info(self, filename: Optional[str], lineno: Optional[int], function: Optional[str], code_context: Optional[str]) -> Dict[str, Optional[str]]:
-        resolved = self._resolve_source_path(filename)
+    def _source_info(self, filename: Optional[str], lineno: Optional[int], function: Optional[str], code_context: Optional[str], rank: Optional[int] = None) -> Dict[str, Optional[str]]:
+        resolved = self._resolve_source_path(filename, rank)
         error: Optional[str] = None
         source_line: Optional[str] = None
         if resolved and lineno:
@@ -464,15 +568,18 @@ class DependencyTraceService:
         params: List[object] = []
         if search:
             pattern = f"%{search}%"
-            where_clause = "WHERE LOWER(node_id) LIKE ? OR LOWER(task_type) LIKE ? OR CAST(layer_id AS TEXT) LIKE ?"
-            params.extend([pattern, pattern, pattern])
+            where_clause = (
+                "WHERE LOWER(node_id) LIKE ? OR LOWER(task_type) LIKE ? OR CAST(layer_id AS TEXT) LIKE ? "
+                "OR CAST(rank AS TEXT) LIKE ?"
+            )
+            params.extend([pattern, pattern, pattern, pattern])
         with self._connection() as conn:
             total_cursor = conn.execute(f"SELECT COUNT(*) FROM tasks {where_clause}", params)
             total = int(total_cursor.fetchone()[0])
             query_sql = (
                 "SELECT node_id, task_type, task_type_id, layer_id, task_id, tile_id, sm_id, rank, "
                 "start_time_ns, duration_ns, finish_time_ns, absolute_start_time_ns "
-                f"FROM tasks {where_clause} ORDER BY start_time_ns ASC LIMIT ? OFFSET ?"
+                f"FROM tasks {where_clause} ORDER BY rank ASC, start_time_ns ASC LIMIT ? OFFSET ?"
             )
             rows = conn.execute(query_sql, (*params, limit, offset)).fetchall()
             tasks = [dict(row) for row in rows]
@@ -494,7 +601,9 @@ class DependencyTraceService:
             "absolute_start_time_ns": row[f"{prefix}_absolute_start_time_ns"],
         }
 
-    def _collect_dependencies(self, conn: sqlite3.Connection, node_id: str, incoming: bool) -> List[Dict[str, object]]:
+    def _collect_dependencies(
+        self, conn: sqlite3.Connection, node_id: str, rank: int, incoming: bool
+    ) -> List[Dict[str, object]]:
         if incoming:
             query = (
                 "SELECT d.src, d.dst, d.src_rank, d.dst_rank, d.start_tile, d.end_tile, d.origin_filename, "
@@ -506,8 +615,8 @@ class DependencyTraceService:
                 "t.duration_ns AS producer_duration_ns, t.finish_time_ns AS producer_finish_time_ns, "
                 "t.absolute_start_time_ns AS producer_absolute_start_time_ns "
                 "FROM dependencies d "
-                "JOIN tasks t ON t.node_id = d.src "
-                "WHERE d.dst = ? "
+                "JOIN tasks t ON t.node_id = d.src AND t.rank = d.src_rank "
+                "WHERE d.dst = ? AND d.dst_rank = ? "
                 "ORDER BY t.start_time_ns ASC"
             )
             role_key = "producer"
@@ -522,12 +631,12 @@ class DependencyTraceService:
                 "t.duration_ns AS consumer_duration_ns, t.finish_time_ns AS consumer_finish_time_ns, "
                 "t.absolute_start_time_ns AS consumer_absolute_start_time_ns "
                 "FROM dependencies d "
-                "JOIN tasks t ON t.node_id = d.dst "
-                "WHERE d.src = ? "
+                "JOIN tasks t ON t.node_id = d.dst AND t.rank = d.dst_rank "
+                "WHERE d.src = ? AND d.src_rank = ? "
                 "ORDER BY t.start_time_ns ASC"
             )
             role_key = "consumer"
-        rows = conn.execute(query, (node_id,)).fetchall()
+        rows = conn.execute(query, (node_id, rank)).fetchall()
         results: List[Dict[str, object]] = []
         for row in rows:
             dependency = {
@@ -548,11 +657,13 @@ class DependencyTraceService:
                 task_info = self._row_to_task(row, "producer")
             else:
                 task_info = self._row_to_task(row, "consumer")
+            source_rank = dependency["src_rank"] if incoming else dependency["dst_rank"]
             source = self._source_info(
                 dependency["origin"].get("filename"),
                 dependency["origin"].get("lineno"),
                 dependency["origin"].get("function"),
                 dependency["origin"].get("code_context"),
+                source_rank,
             )
             results.append({
                 "dependency": dependency,
@@ -561,18 +672,18 @@ class DependencyTraceService:
             })
         return results
 
-    def task_detail(self, node_id: str) -> Optional[Dict[str, object]]:
+    def task_detail(self, node_id: str, rank: int) -> Optional[Dict[str, object]]:
         with self._connection() as conn:
             row = conn.execute(
                 "SELECT node_id, task_type, task_type_id, layer_id, task_id, tile_id, sm_id, rank, "
-                "start_time_ns, duration_ns, finish_time_ns, absolute_start_time_ns FROM tasks WHERE node_id = ?",
-                (node_id,),
+                "start_time_ns, duration_ns, finish_time_ns, absolute_start_time_ns FROM tasks WHERE node_id = ? AND rank = ?",
+                (node_id, rank),
             ).fetchone()
             if row is None:
                 return None
             task = dict(row)
-            inputs = self._collect_dependencies(conn, node_id, incoming=True)
-            dependents = self._collect_dependencies(conn, node_id, incoming=False)
+            inputs = self._collect_dependencies(conn, node_id, rank, incoming=True)
+            dependents = self._collect_dependencies(conn, node_id, rank, incoming=False)
         return {"task": task, "inputs": inputs, "dependents": dependents}
 
 
@@ -638,6 +749,7 @@ HTML_PAGE = """
         <thead>
           <tr>
             <th>Node</th>
+            <th>Rank</th>
             <th>Type</th>
             <th>Layer</th>
             <th>Task</th>
@@ -668,6 +780,10 @@ HTML_PAGE = """
     let offset = 0;
     let total = 0;
     let currentSelection = null;
+
+    function makeTaskKey(task) {
+      return `${task.rank}:${task.node_id}`;
+    }
 
     function formatNs(ns) {
       if (typeof ns !== 'number') return '—';
@@ -700,11 +816,14 @@ HTML_PAGE = """
       tasks.forEach(task => {
         const row = document.createElement('tr');
         row.dataset.nodeId = task.node_id;
-        if (task.node_id === currentSelection) {
+        row.dataset.rank = task.rank;
+        const key = makeTaskKey(task);
+        if (key === currentSelection) {
           row.classList.add('selected');
         }
         const cells = [
           task.node_id,
+          task.rank,
           task.task_type,
           task.layer_id,
           task.task_id,
@@ -718,10 +837,10 @@ HTML_PAGE = """
           row.appendChild(cell);
         });
         row.addEventListener('click', () => {
-          currentSelection = task.node_id;
+          currentSelection = key;
           document.querySelectorAll('tr.selected').forEach(el => el.classList.remove('selected'));
           row.classList.add('selected');
-          loadTaskDetails(task.node_id);
+          loadTaskDetails(task.node_id, task.rank);
         });
         tasksBody.appendChild(row);
       });
@@ -746,11 +865,21 @@ HTML_PAGE = """
         entry.className = 'dependency-item';
         const header = document.createElement('h4');
         const role = item[roleLabel];
-        header.textContent = `${role.node_id} • layer ${role.layer_id} task ${role.task_id} tile ${role.tile_id}`;
+        const rankLabel = role.rank ?? '—';
+        header.textContent = `${role.node_id} • rank ${rankLabel} • layer ${role.layer_id} task ${role.task_id} tile ${role.tile_id}`;
         entry.appendChild(header);
 
         const meta = document.createElement('div');
-        meta.textContent = `Tiles ${item.dependency.start_tile} – ${item.dependency.end_tile}`;
+        const metaParts = [];
+        if (item.dependency.src_rank !== null && item.dependency.src_rank !== undefined &&
+            item.dependency.dst_rank !== null && item.dependency.dst_rank !== undefined) {
+          metaParts.push(`Ranks ${item.dependency.src_rank} → ${item.dependency.dst_rank}`);
+        }
+        if (item.dependency.start_tile !== null && item.dependency.start_tile !== undefined &&
+            item.dependency.end_tile !== null && item.dependency.end_tile !== undefined) {
+          metaParts.push(`Tiles ${item.dependency.start_tile} – ${item.dependency.end_tile}`);
+        }
+        meta.textContent = metaParts.length ? metaParts.join(' • ') : '—';
         entry.appendChild(meta);
 
         const origin = item.source;
@@ -804,6 +933,7 @@ HTML_PAGE = """
       const metaGrid = document.createElement('div');
       metaGrid.className = 'meta-grid';
       const entries = [
+        ['Rank', data.task.rank],
         ['Task type', data.task.task_type],
         ['Layer', data.task.layer_id],
         ['Task id', data.task.task_id],
@@ -850,8 +980,8 @@ HTML_PAGE = """
       renderTasks(data.tasks);
     }
 
-    async function loadTaskDetails(nodeId) {
-      const response = await fetch(`/api/task/${encodeURIComponent(nodeId)}`);
+    async function loadTaskDetails(nodeId, rank) {
+      const response = await fetch(`/api/task/${encodeURIComponent(nodeId)}?rank=${encodeURIComponent(rank)}`);
       if (!response.ok) {
         taskDetails.className = 'empty-state';
         taskDetails.textContent = 'Failed to load task details.';
@@ -924,12 +1054,18 @@ def make_handler(service: DependencyTraceService):
                 self._write_json(payload)
                 return
             if parsed.path.startswith("/api/task/"):
-                node_id = parsed.path[len("/api/task/") :]
+                node_id = unquote(parsed.path[len("/api/task/") :])
+                qs = parse_qs(parsed.query or "")
+                rank_values = qs.get("rank")
+                if not rank_values:
+                    self._write_json({"error": "rank query parameter is required"}, status=400)
+                    return
                 try:
-                    node_id = parse_qs(f"node={node_id}")["node"][0]
-                except Exception:  # noqa: BLE001 - defensive parsing
-                    pass
-                detail = service.task_detail(node_id)
+                    rank = int(rank_values[0])
+                except ValueError:
+                    self._write_json({"error": "rank must be an integer"}, status=400)
+                    return
+                detail = service.task_detail(node_id, rank)
                 if detail is None:
                     self._write_json({"error": "task not found"}, status=404)
                 else:
@@ -950,7 +1086,11 @@ def make_handler(service: DependencyTraceService):
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Serve an inspector for dependency traces")
-    parser.add_argument("--trace", required=True, help="Path to dependency trace JSON file")
+    parser.add_argument(
+        "--trace",
+        required=True,
+        help="Path to a dependency trace JSON file, directory of traces, or glob pattern",
+    )
     parser.add_argument(
         "--database",
         help="Optional path to a SQLite database used to cache the ingested trace",
@@ -962,9 +1102,20 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
-    trace_path = Path(args.trace)
-    if not trace_path.exists():
-        raise SystemExit(f"Trace file {trace_path} does not exist")
+    trace_arg = Path(args.trace)
+    trace_paths: List[Path]
+    if trace_arg.exists():
+        if trace_arg.is_dir():
+            trace_paths = sorted(p for p in trace_arg.glob("*.json") if p.is_file())
+            if not trace_paths:
+                raise SystemExit(f"No JSON trace files found in directory {trace_arg}")
+        else:
+            trace_paths = [trace_arg]
+    else:
+        matched = sorted(Path(path) for path in glob.glob(args.trace))
+        trace_paths = [p for p in matched if p.is_file()]
+        if not trace_paths:
+            raise SystemExit(f"No trace files matched pattern {args.trace!r}")
     if args.database:
         db_path = Path(args.database)
     else:
@@ -973,11 +1124,11 @@ def main(argv: Optional[List[str]] = None) -> None:
         db_path = Path(db_name)
     conn = sqlite3.connect(str(db_path))
     try:
-        ingest_trace(trace_path, conn)
+        ingest_traces(trace_paths, conn)
     finally:
         conn.close()
 
-    service = DependencyTraceService(db_path, trace_path)
+    service = DependencyTraceService(db_path, trace_paths)
     handler_cls = make_handler(service)
     server = ThreadingHTTPServer((args.host, args.port), handler_cls)
     print(f"Serving dependency trace inspector on http://{args.host}:{args.port}")
