@@ -35,7 +35,11 @@ import torch
 
 from .viewer import parse_to_tracks, Task as ProfiledTask
 
-from triton_dist.mega_triton_kernel.core.task_base import TaskBase, TaskDependency
+from triton_dist.mega_triton_kernel.core.task_base import (
+    TaskBase,
+    TaskDependency,
+    get_default_dependency_origin_base,
+)
 
 
 @dataclass
@@ -298,6 +302,8 @@ def export_dependency_trace(
 ) -> str:
     if not trace_file.endswith(".json"):
         trace_file = f"{trace_file}.json"
+    if base_dir is None:
+        base_dir = get_default_dependency_origin_base()
     builder = DependencyTraceBuilder(
         profiler_buffer=profiler_buffer,
         task_types_to_str=task_types_to_str,

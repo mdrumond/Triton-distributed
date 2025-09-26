@@ -22,15 +22,50 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-from typing import Dict, Type, List, Any, Tuple, Union, Optional
+from typing import Dict, Type, List, Any, Tuple, Union, Optional, Set
 from dataclasses import dataclass, field
 import inspect
 import os
+from pathlib import Path
+
 from .config import ConfigBase
 import torch
 from .utils import has_slice_intersection
 
-_DEFAULT_DEP_ORIGIN_BASE = os.environ.get("MEGAKERNEL_DEP_TRACE_BASE")
+
+def _detect_repo_root(start_path: Optional[Path] = None) -> Optional[str]:
+    """Best-effort discovery of the Triton-distributed repository root."""
+
+    search_roots = []
+    if start_path is not None:
+        search_roots.append(start_path)
+    module_dir = Path(__file__).resolve().parent
+    search_roots.append(module_dir)
+    cwd = Path.cwd()
+    if cwd not in search_roots:
+        search_roots.append(cwd)
+
+    seen: Set[Path] = set()
+    for root in search_roots:
+        current = root
+        while True:
+            if current in seen:
+                break
+            seen.add(current)
+            git_dir = current / ".git"
+            if git_dir.is_dir():
+                return str(current)
+            if current.parent == current:
+                break
+            current = current.parent
+    return None
+
+
+_DEFAULT_DEP_ORIGIN_BASE = os.environ.get("MEGAKERNEL_DEP_TRACE_BASE") or _detect_repo_root()
+
+
+def get_default_dependency_origin_base() -> Optional[str]:
+    return _DEFAULT_DEP_ORIGIN_BASE
 
 # To satisfy the alignment requirement of tensor data_ptr, MAX_NUM_TENSOR_DIMS must be an even number.
 MAX_NUM_TENSOR_DIMS = 4
