@@ -584,7 +584,6 @@ class ModelBuilder:
     def dump_trace(
         self,
         trace_file_prefix: str = "MEGA_KERNEL_TRACE",
-        max_dependency_paths: int = 5,
         dependency_trace_base_dir: Optional[str] = None,
     ):
         if self._enable_profiling:
@@ -600,7 +599,6 @@ class ModelBuilder:
                 wq_tensor=self.wq_tensor,
                 num_tasks_tensor=self.num_tasks_tensor,
                 scheduled_tasks=self._scheduled_tasks,
-                max_paths=max_dependency_paths,
                 base_dir=dependency_trace_base_dir,
             )
         else:

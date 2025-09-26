@@ -68,16 +68,6 @@ class TraceDependency:
         return asdict(self)
 
 
-@dataclass
-class CriticalPath:
-    total_duration_ns: int
-    slack_ns: int
-    tasks: List[str]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
-
-
 class DependencyTraceBuilder:
     def __init__(
         self,
@@ -96,10 +86,6 @@ class DependencyTraceBuilder:
         self._task_lookup: Dict[Tuple[int, int, int, int], TaskBase] = {}
         self._task_nodes: Dict[str, TraceTask] = {}
         self._edges: List[TraceDependency] = []
-        self._graph: Dict[str, List[str]] = {}
-        self._reverse_graph: Dict[str, List[str]] = {}
-        self._path_finish_time: Dict[str, int] = {}
-        self._pred: Dict[str, Optional[str]] = {}
         self._min_start_time: int = 0
         self._logical_to_key: Dict[Tuple[int, int, int], List[Tuple[int, int, int, int]]] = {}
         self._base_dir = base_dir
@@ -230,15 +216,9 @@ class DependencyTraceBuilder:
             node.finish_time_ns = relative_start + node.duration_ns
 
     def _build_edges(self) -> None:
-        adjacency: Dict[str, List[str]] = {}
-        reverse_adj: Dict[str, List[str]] = {}
         edge_keys = set()
         for node_id, node in self._task_nodes.items():
             task = self._task_lookup[(node.task_type_id, node.layer_id, node.task_id, node.tile_id)]
-            if not adjacency.get(node_id):
-                adjacency[node_id] = []
-            if node_id not in reverse_adj:
-                reverse_adj[node_id] = []
             for dep in task.dependency:
                 assert isinstance(dep, TaskDependency)
                 producer_keys: List[Tuple[int, int, int, int]] = []
@@ -281,8 +261,6 @@ class DependencyTraceBuilder:
                         origin=origin_dict,
                     )
                     self._edges.append(edge)
-                    adjacency.setdefault(src_id, []).append(node_id)
-                    reverse_adj.setdefault(node_id, []).append(src_id)
                     found_src = True
                     break
                 if not found_src:
@@ -290,77 +268,12 @@ class DependencyTraceBuilder:
                         f"Unable to map dependency {dep} for task {node_id} to profiled producer; skipping edge.",
                         level="warning",
                     )
-        self._graph = adjacency
-        self._reverse_graph = reverse_adj
-
-    def _topological_order(self) -> List[str]:
-        indegree: Dict[str, int] = {node: 0 for node in self._task_nodes}
-        for src, dsts in self._graph.items():
-            for dst in dsts:
-                indegree[dst] = indegree.get(dst, 0) + 1
-        queue = [node for node, deg in indegree.items() if deg == 0]
-        topo: List[str] = []
-        idx = 0
-        while idx < len(queue):
-            node = queue[idx]
-            idx += 1
-            topo.append(node)
-            for nbr in self._graph.get(node, []):
-                indegree[nbr] -= 1
-                if indegree[nbr] == 0:
-                    queue.append(nbr)
-        if len(topo) != len(self._task_nodes):
-            raise RuntimeError("Cycle detected in dependency graph; cannot compute critical path.")
-        return topo
-
-    def _compute_critical_paths(self, max_paths: int = 5) -> List[CriticalPath]:
-        topo = self._topological_order()
-        finish_time: Dict[str, int] = {}
-        pred: Dict[str, Optional[str]] = {node: None for node in self._task_nodes}
-        for node_id in topo:
-            node = self._task_nodes[node_id]
-            if not self._reverse_graph.get(node_id):
-                finish_time[node_id] = node.finish_time_ns
-            else:
-                best_finish = node.finish_time_ns
-                best_pred = None
-                for src in self._reverse_graph[node_id]:
-                    candidate_ready = max(finish_time[src], node.start_time_ns)
-                    candidate_finish = candidate_ready + node.duration_ns
-                    if candidate_finish > best_finish:
-                        best_finish = candidate_finish
-                        best_pred = src
-                finish_time[node_id] = best_finish
-                pred[node_id] = best_pred
-        self._path_finish_time = finish_time
-        self._pred = pred
-        sorted_nodes = sorted(finish_time.items(), key=lambda kv: kv[1], reverse=True)
-        critical_total = sorted_nodes[0][1] if sorted_nodes else 0
-        paths: List[CriticalPath] = []
-        seen_paths: set = set()
-        for node_id, finish in sorted_nodes[:max_paths * 2]:
-            path_nodes = []
-            cur = node_id
-            while cur is not None:
-                path_nodes.append(cur)
-                cur = pred.get(cur)
-            path_nodes.reverse()
-            path_key = tuple(path_nodes)
-            if path_key in seen_paths:
-                continue
-            seen_paths.add(path_key)
-            slack = max(0, critical_total - finish)
-            paths.append(CriticalPath(total_duration_ns=finish, slack_ns=slack, tasks=path_nodes))
-            if len(paths) >= max_paths:
-                break
-        return paths
 
     # ---------------------------- public API ---------------------------------
-    def build(self, max_paths: int = 5) -> Dict[str, Any]:
+    def build(self) -> Dict[str, Any]:
         self._build_task_lookup()
         self._build_nodes()
         self._build_edges()
-        critical_paths = self._compute_critical_paths(max_paths=max_paths)
         tasks_sorted = sorted(self._task_nodes.values(), key=lambda n: (n.start_time_ns, n.node_id))
         edges_sorted = sorted(
             self._edges,
@@ -369,8 +282,8 @@ class DependencyTraceBuilder:
         return {
             "tasks": [node.to_dict() for node in tasks_sorted],
             "dependencies": [edge.to_dict() for edge in edges_sorted],
-            "critical_paths": [path.to_dict() for path in critical_paths],
             "min_start_time_ns": self._min_start_time,
+            "origin_base_dir": self._base_dir,
         }
 
 
@@ -381,7 +294,6 @@ def export_dependency_trace(
     wq_tensor: torch.Tensor,
     num_tasks_tensor: torch.Tensor,
     scheduled_tasks: Iterable["TaskBase"],
-    max_paths: int = 5,
     base_dir: Optional[str] = None,
 ) -> str:
     if not trace_file.endswith(".json"):
@@ -394,7 +306,7 @@ def export_dependency_trace(
         scheduled_tasks=scheduled_tasks,
         base_dir=base_dir,
     )
-    data = builder.build(max_paths=max_paths)
+    data = builder.build()
     with open(trace_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
     return trace_file

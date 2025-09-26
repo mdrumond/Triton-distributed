@@ -1,31 +1,12 @@
-"""Dependency trace exploration and visualization server.
+"""Dependency trace inspection server.
 
-This module provides a small utility that can ingest a dependency trace JSON
-file exported by :mod:`dependency_trace` and expose a browser-based UI for
-exploring the most critical execution paths.  The ingestion logic streams the
-JSON file into a SQLite database so that even very large traces can be handled
-without loading the entire payload into memory.
-
-Example usage::
-
-    python -m triton_dist.tools.profiler.critical_path_server \
-        --trace /path/to/dependency_trace.json --serve
-
-To inspect the top N critical paths directly from the command line::
-
-    python -m triton_dist.tools.profiler.critical_path_server \
-        --trace /path/to/dependency_trace.json --top 10
-
-The script can also report the tasks that are common to a set of critical
-paths::
-
-    python -m triton_dist.tools.profiler.critical_path_server \
-        --trace /path/to/dependency_trace.json --common 0 2 5
-
-The ``--serve`` flag starts a lightweight HTTP server that serves both a JSON
-API and a simple HTML UI for interactive exploration.  The UI allows choosing
-how many critical paths to load, inspecting each path, and selecting multiple
-paths to highlight tasks common to all selections.
+This module ingests the dependency trace JSON produced by
+``dependency_trace.export_dependency_trace`` and exposes a lightweight HTTP
+interface for inspecting individual tasks.  Users can browse the tasks,
+select one, and view both its producers and consumers together with the code
+locations that established the dependencies.  The ingestion path streams the
+JSON payload into a SQLite database so large traces can be explored without
+loading them fully into memory.
 """
 
 from __future__ import annotations
@@ -33,15 +14,20 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import linecache
 import os
 import sqlite3
 import sys
 import tempfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
+
+# --------------------------------------------------------------------------------------
+# Streaming JSON helpers
+# --------------------------------------------------------------------------------------
 
 def _read_next_non_ws(fp) -> str:
     while True:
@@ -198,7 +184,14 @@ def _read_post_value_delimiter(fp) -> Optional[str]:
         raise ValueError(f"Unexpected character {ch!r} after JSON value")
 
 
+# --------------------------------------------------------------------------------------
+# Database ingestion
+# --------------------------------------------------------------------------------------
+
+
 def initialise_database(conn: sqlite3.Connection) -> None:
+    conn.execute("DROP TABLE IF EXISTS critical_paths")
+    conn.execute("DROP TABLE IF EXISTS critical_path_tasks")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS tasks (
@@ -223,26 +216,10 @@ def initialise_database(conn: sqlite3.Connection) -> None:
             dst TEXT,
             start_tile INTEGER,
             end_tile INTEGER,
-            origin TEXT
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS critical_paths (
-            path_index INTEGER PRIMARY KEY,
-            total_duration_ns INTEGER,
-            slack_ns INTEGER
-        )
-        """
-    )
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS critical_path_tasks (
-            path_index INTEGER,
-            ordinal INTEGER,
-            task_node_id TEXT,
-            PRIMARY KEY (path_index, ordinal)
+            origin_filename TEXT,
+            origin_lineno INTEGER,
+            origin_function TEXT,
+            origin_code_context TEXT
         )
         """
     )
@@ -260,8 +237,6 @@ def initialise_database(conn: sqlite3.Connection) -> None:
 def clear_database(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM tasks")
     conn.execute("DELETE FROM dependencies")
-    conn.execute("DELETE FROM critical_paths")
-    conn.execute("DELETE FROM critical_path_tasks")
     conn.execute("DELETE FROM metadata")
     conn.commit()
 
@@ -320,58 +295,35 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
                             dst,
                             start_tile,
                             end_tile,
-                            origin
-                        ) VALUES (?, ?, ?, ?, ?)
+                            origin_filename,
+                            origin_lineno,
+                            origin_function,
+                            origin_code_context
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             obj.get("src"),
                             obj.get("dst"),
                             obj.get("start_tile"),
                             obj.get("end_tile"),
-                            json.dumps(obj.get("origin")) if obj.get("origin") is not None else None,
+                            (obj.get("origin") or {}).get("filename"),
+                            (obj.get("origin") or {}).get("lineno"),
+                            (obj.get("origin") or {}).get("function"),
+                            (obj.get("origin") or {}).get("code_context"),
                         ),
                     ),
                 )
-            elif key == "critical_paths":
-                path_counter = 0
-
-                def _insert_path(obj):
-                    nonlocal path_counter
-                    path_index = path_counter
-                    path_counter += 1
-                    conn.execute(
-                        """
-                        INSERT INTO critical_paths (
-                            path_index,
-                            total_duration_ns,
-                            slack_ns
-                        ) VALUES (?, ?, ?)
-                        """,
-                        (
-                            path_index,
-                            obj.get("total_duration_ns"),
-                            obj.get("slack_ns"),
-                        ),
-                    )
-                    tasks = obj.get("tasks", [])
-                    for ordinal, node_id in enumerate(tasks):
-                        conn.execute(
-                            """
-                            INSERT INTO critical_path_tasks (
-                                path_index,
-                                ordinal,
-                                task_node_id
-                            ) VALUES (?, ?, ?)
-                            """,
-                            (path_index, ordinal, node_id),
-                        )
-
-                _stream_array(fp, _insert_path)
             elif key == "min_start_time_ns":
                 value = _read_scalar(fp)
                 conn.execute(
                     "INSERT INTO metadata (key, value) VALUES (?, ?)",
                     ("min_start_time_ns", json.dumps(value)),
+                )
+            elif key == "origin_base_dir":
+                value = _read_scalar(fp)
+                conn.execute(
+                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                    ("origin_base_dir", json.dumps(value)),
                 )
             else:
                 _skip_value(fp)
@@ -383,9 +335,16 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-class CriticalPathService:
-    def __init__(self, db_path: Path) -> None:
+# --------------------------------------------------------------------------------------
+# Query service
+# --------------------------------------------------------------------------------------
+
+
+class DependencyTraceService:
+    def __init__(self, db_path: Path, trace_path: Path) -> None:
         self._db_path = db_path
+        self._trace_path = trace_path
+        self._metadata_cache: Optional[Dict[str, Optional[str]]] = None
 
     @contextlib.contextmanager
     def _connection(self):
@@ -396,58 +355,178 @@ class CriticalPathService:
         finally:
             conn.close()
 
-    def top_paths(self, limit: int) -> List[dict]:
+    def _load_metadata(self) -> Dict[str, Optional[str]]:
+        if self._metadata_cache is not None:
+            return self._metadata_cache
+        data: Dict[str, Optional[str]] = {}
         with self._connection() as conn:
-            cursor = conn.execute(
-                """
-                SELECT cp.path_index, cp.total_duration_ns, cp.slack_ns,
-                       COUNT(cpt.task_node_id) AS length
-                FROM critical_paths cp
-                LEFT JOIN critical_path_tasks cpt
-                    ON cp.path_index = cpt.path_index
-                GROUP BY cp.path_index
-                ORDER BY cp.total_duration_ns DESC, cp.path_index ASC
-                LIMIT ?
-                """,
-                (limit,),
-            )
-            rows = cursor.fetchall()
-            return [dict(row) for row in rows]
+            cursor = conn.execute("SELECT key, value FROM metadata")
+            for row in cursor.fetchall():
+                value = row["value"]
+                try:
+                    data[row["key"]] = json.loads(value)
+                except (TypeError, json.JSONDecodeError):
+                    data[row["key"]] = value
+        self._metadata_cache = data
+        return data
 
-    def path_tasks(self, path_index: int) -> List[dict]:
-        with self._connection() as conn:
-            cursor = conn.execute(
-                """
-                SELECT cpt.ordinal, t.*
-                FROM critical_path_tasks cpt
-                JOIN tasks t ON t.node_id = cpt.task_node_id
-                WHERE cpt.path_index = ?
-                ORDER BY cpt.ordinal ASC
-                """,
-                (path_index,),
-            )
-            return [dict(row) for row in cursor.fetchall()]
+    @property
+    def metadata(self) -> Dict[str, Optional[str]]:
+        return self._load_metadata()
 
-    def common_tasks(self, path_indices: Iterable[int]) -> List[dict]:
-        indices = list(path_indices)
-        if not indices:
-            return []
-        placeholders = ",".join("?" for _ in indices)
-        query = f"""
-            SELECT t.*
-            FROM tasks t
-            JOIN (
-                SELECT task_node_id
-                FROM critical_path_tasks
-                WHERE path_index IN ({placeholders})
-                GROUP BY task_node_id
-                HAVING COUNT(DISTINCT path_index) = ?
-            ) shared ON shared.task_node_id = t.node_id
-            ORDER BY t.start_time_ns ASC
-        """
+    def _resolve_source_path(self, filename: Optional[str]) -> Optional[str]:
+        if not filename:
+            return None
+        if os.path.isabs(filename) and os.path.exists(filename):
+            return os.path.abspath(filename)
+        candidates: List[str] = []
+        base_dir = self.metadata.get("origin_base_dir")
+        if base_dir:
+            candidates.append(os.path.join(base_dir, filename))
+        candidates.append(os.path.join(self._trace_path.parent, filename))
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return os.path.abspath(candidate)
+        return None
+
+    def _source_info(self, filename: Optional[str], lineno: Optional[int], function: Optional[str], code_context: Optional[str]) -> Dict[str, Optional[str]]:
+        resolved = self._resolve_source_path(filename)
+        error: Optional[str] = None
+        source_line: Optional[str] = None
+        if resolved and lineno:
+            line = linecache.getline(resolved, int(lineno))
+            if line:
+                source_line = line.rstrip("\n")
+            else:
+                error = "Unable to read source line"
+        elif filename and lineno:
+            error = "Source file not found"
+        return {
+            "requested_path": filename,
+            "resolved_path": resolved,
+            "lineno": lineno,
+            "function": function,
+            "code_context": code_context,
+            "source_line": source_line,
+            "error": error,
+        }
+
+    def list_tasks(self, limit: int, offset: int, query: Optional[str]) -> Dict[str, object]:
+        search = (query or "").strip().lower()
+        where_clause = ""
+        params: List[object] = []
+        if search:
+            pattern = f"%{search}%"
+            where_clause = "WHERE LOWER(node_id) LIKE ? OR LOWER(task_type) LIKE ? OR CAST(layer_id AS TEXT) LIKE ?"
+            params.extend([pattern, pattern, pattern])
         with self._connection() as conn:
-            cursor = conn.execute(query, (*indices, len(indices)))
-            return [dict(row) for row in cursor.fetchall()]
+            total_cursor = conn.execute(f"SELECT COUNT(*) FROM tasks {where_clause}", params)
+            total = int(total_cursor.fetchone()[0])
+            query_sql = (
+                "SELECT node_id, task_type, task_type_id, layer_id, task_id, tile_id, sm_id, "
+                "start_time_ns, duration_ns, finish_time_ns, absolute_start_time_ns "
+                f"FROM tasks {where_clause} ORDER BY start_time_ns ASC LIMIT ? OFFSET ?"
+            )
+            rows = conn.execute(query_sql, (*params, limit, offset)).fetchall()
+            tasks = [dict(row) for row in rows]
+        return {"tasks": tasks, "total": total, "offset": offset, "limit": limit}
+
+    def _row_to_task(self, row: sqlite3.Row, prefix: str) -> Dict[str, object]:
+        return {
+            "node_id": row[f"{prefix}_node_id"],
+            "task_type": row[f"{prefix}_task_type"],
+            "task_type_id": row[f"{prefix}_task_type_id"],
+            "layer_id": row[f"{prefix}_layer_id"],
+            "task_id": row[f"{prefix}_task_id"],
+            "tile_id": row[f"{prefix}_tile_id"],
+            "sm_id": row[f"{prefix}_sm_id"],
+            "start_time_ns": row[f"{prefix}_start_time_ns"],
+            "duration_ns": row[f"{prefix}_duration_ns"],
+            "finish_time_ns": row[f"{prefix}_finish_time_ns"],
+            "absolute_start_time_ns": row[f"{prefix}_absolute_start_time_ns"],
+        }
+
+    def _collect_dependencies(self, conn: sqlite3.Connection, node_id: str, incoming: bool) -> List[Dict[str, object]]:
+        if incoming:
+            query = (
+                "SELECT d.src, d.dst, d.start_tile, d.end_tile, d.origin_filename, d.origin_lineno, "
+                "d.origin_function, d.origin_code_context, "
+                "t.node_id AS producer_node_id, t.task_type AS producer_task_type, "
+                "t.task_type_id AS producer_task_type_id, t.layer_id AS producer_layer_id, "
+                "t.task_id AS producer_task_id, t.tile_id AS producer_tile_id, t.sm_id AS producer_sm_id, "
+                "t.start_time_ns AS producer_start_time_ns, t.duration_ns AS producer_duration_ns, "
+                "t.finish_time_ns AS producer_finish_time_ns, t.absolute_start_time_ns AS producer_absolute_start_time_ns "
+                "FROM dependencies d "
+                "JOIN tasks t ON t.node_id = d.src "
+                "WHERE d.dst = ? "
+                "ORDER BY t.start_time_ns ASC"
+            )
+            role_key = "producer"
+        else:
+            query = (
+                "SELECT d.src, d.dst, d.start_tile, d.end_tile, d.origin_filename, d.origin_lineno, "
+                "d.origin_function, d.origin_code_context, "
+                "t.node_id AS consumer_node_id, t.task_type AS consumer_task_type, "
+                "t.task_type_id AS consumer_task_type_id, t.layer_id AS consumer_layer_id, "
+                "t.task_id AS consumer_task_id, t.tile_id AS consumer_tile_id, t.sm_id AS consumer_sm_id, "
+                "t.start_time_ns AS consumer_start_time_ns, t.duration_ns AS consumer_duration_ns, "
+                "t.finish_time_ns AS consumer_finish_time_ns, t.absolute_start_time_ns AS consumer_absolute_start_time_ns "
+                "FROM dependencies d "
+                "JOIN tasks t ON t.node_id = d.dst "
+                "WHERE d.src = ? "
+                "ORDER BY t.start_time_ns ASC"
+            )
+            role_key = "consumer"
+        rows = conn.execute(query, (node_id,)).fetchall()
+        results: List[Dict[str, object]] = []
+        for row in rows:
+            dependency = {
+                "src": row["src"],
+                "dst": row["dst"],
+                "start_tile": row["start_tile"],
+                "end_tile": row["end_tile"],
+                "origin": {
+                    "filename": row["origin_filename"],
+                    "lineno": row["origin_lineno"],
+                    "function": row["origin_function"],
+                    "code_context": row["origin_code_context"],
+                },
+            }
+            if incoming:
+                task_info = self._row_to_task(row, "producer")
+            else:
+                task_info = self._row_to_task(row, "consumer")
+            source = self._source_info(
+                dependency["origin"].get("filename"),
+                dependency["origin"].get("lineno"),
+                dependency["origin"].get("function"),
+                dependency["origin"].get("code_context"),
+            )
+            results.append({
+                "dependency": dependency,
+                role_key: task_info,
+                "source": source,
+            })
+        return results
+
+    def task_detail(self, node_id: str) -> Optional[Dict[str, object]]:
+        with self._connection() as conn:
+            row = conn.execute(
+                "SELECT node_id, task_type, task_type_id, layer_id, task_id, tile_id, sm_id, "
+                "start_time_ns, duration_ns, finish_time_ns, absolute_start_time_ns FROM tasks WHERE node_id = ?",
+                (node_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            task = dict(row)
+            inputs = self._collect_dependencies(conn, node_id, incoming=True)
+            dependents = self._collect_dependencies(conn, node_id, incoming=False)
+        return {"task": task, "inputs": inputs, "dependents": dependents}
+
+
+# --------------------------------------------------------------------------------------
+# HTTP API and UI
+# --------------------------------------------------------------------------------------
 
 
 HTML_PAGE = """
@@ -455,209 +534,316 @@ HTML_PAGE = """
 <html lang=\"en\">
 <head>
   <meta charset=\"utf-8\" />
-  <title>Critical Path Explorer</title>
+  <title>Dependency Trace Inspector</title>
   <style>
-    body { font-family: Arial, sans-serif; margin: 0; padding: 0; background: #f5f7fa; }
-    header { background: #1f2933; color: #fff; padding: 1rem 2rem; }
-    main { padding: 1.5rem 2rem; }
-    h1 { margin: 0; font-size: 1.75rem; }
-    section { margin-bottom: 2rem; }
-    table { border-collapse: collapse; width: 100%; background: #fff; }
-    th, td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #e4e7eb; text-align: left; }
-    th { background: #f0f4f8; }
-    tr:hover { background: #f8fafc; }
-    .path-row.selected { background: #e1effe; }
-    .controls { display: flex; gap: 1rem; align-items: center; margin-bottom: 1rem; }
-    .badge { display: inline-block; background: #3b82f6; color: #fff; border-radius: 9999px; padding: 0.2rem 0.6rem; font-size: 0.8rem; }
-    .panel { background: #fff; padding: 1rem; border-radius: 0.5rem; box-shadow: 0 1px 4px rgba(15, 23, 42, 0.08); }
-    .task-list { list-style: none; padding: 0; margin: 0; max-height: 320px; overflow-y: auto; }
-    .task-list li { padding: 0.5rem 0; border-bottom: 1px solid #e4e7eb; }
-    .empty-state { color: #6b7280; font-style: italic; }
-    .path-details { margin-top: 1rem; }
-    button { padding: 0.4rem 0.9rem; border-radius: 0.4rem; border: none; background: #2563eb; color: #fff; cursor: pointer; }
-    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, \"Segoe UI\", sans-serif; margin: 0; background: #f6f7fb; color: #1f2933; }
+    header { background: #111827; color: #f9fafb; padding: 1.2rem 2rem; }
+    header h1 { margin: 0; font-size: 1.75rem; }
+    main { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; padding: 1.5rem 2rem 2.5rem; }
+    .panel { background: #ffffff; border-radius: 0.75rem; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); padding: 1.25rem; display: flex; flex-direction: column; }
+    .panel h2 { margin-top: 0; font-size: 1.25rem; }
+    .controls { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1rem; align-items: center; }
     label { font-weight: 600; }
-    input[type=number] { padding: 0.3rem 0.5rem; border-radius: 0.3rem; border: 1px solid #cbd5e1; width: 6rem; }
+    input[type=text], input[type=number] { padding: 0.4rem 0.6rem; border-radius: 0.5rem; border: 1px solid #cbd5e1; min-width: 10rem; }
+    button { padding: 0.45rem 0.9rem; border-radius: 0.5rem; border: none; background: #2563eb; color: #fff; cursor: pointer; font-weight: 600; }
+    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    table { width: 100%; border-collapse: collapse; border-radius: 0.5rem; overflow: hidden; box-shadow: inset 0 0 0 1px #e2e8f0; }
+    thead { background: #f1f5f9; }
+    th, td { padding: 0.55rem 0.75rem; text-align: left; font-size: 0.9rem; border-bottom: 1px solid #e2e8f0; }
+    tr:hover { background: #eef2ff; }
+    tr.selected { background: #dbeafe; }
+    .empty-state { color: #6b7280; font-style: italic; }
+    .dependency-list { list-style: none; padding: 0; margin: 0; display: flex; flex-direction: column; gap: 0.75rem; }
+    .dependency-item { border: 1px solid #e2e8f0; border-radius: 0.65rem; padding: 0.75rem 0.9rem; background: #f8fafc; }
+    .dependency-item h4 { margin: 0 0 0.35rem 0; font-size: 1rem; color: #1d4ed8; }
+    .dependency-item pre { margin: 0.5rem 0 0 0; padding: 0.6rem; background: #0f172a; color: #f1f5f9; border-radius: 0.5rem; overflow-x: auto; }
+    .meta-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); gap: 0.6rem; margin-bottom: 1rem; }
+    .meta-card { background: #f8fafc; border-radius: 0.6rem; padding: 0.6rem 0.75rem; border: 1px solid #e2e8f0; }
+    .meta-card span { display: block; font-size: 0.75rem; color: #64748b; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 0.35rem; }
+    @media (max-width: 1200px) {
+      main { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1>Critical Path Explorer</h1>
+    <h1>Dependency Trace Inspector</h1>
   </header>
   <main>
     <section class=\"panel\">
+      <h2>Tasks</h2>
       <div class=\"controls\">
-        <label for=\"limit\">Top N paths:</label>
-        <input id=\"limit\" type=\"number\" min=\"1\" max=\"200\" value=\"10\" />
+        <label for=\"search\">Search</label>
+        <input id=\"search\" type=\"text\" placeholder=\"Node id, task type, or layer\" />
+        <label for=\"limit\">Limit</label>
+        <input id=\"limit\" type=\"number\" min=\"1\" max=\"500\" value=\"50\" />
         <button id=\"loadBtn\">Load</button>
+        <button id=\"prevBtn\">Prev</button>
+        <button id=\"nextBtn\">Next</button>
       </div>
       <table>
         <thead>
           <tr>
-            <th>Select</th>
-            <th>#</th>
-            <th>Total Duration (ms)</th>
-            <th>Slack (ms)</th>
-            <th>Tasks</th>
+            <th>Node</th>
+            <th>Type</th>
+            <th>Layer</th>
+            <th>Task</th>
+            <th>Tile</th>
+            <th>Start (ms)</th>
+            <th>Duration (µs)</th>
           </tr>
         </thead>
-        <tbody id=\"pathsBody\"></tbody>
+        <tbody id=\"tasksBody\"></tbody>
       </table>
+      <p id=\"tasksStatus\" class=\"empty-state\" style=\"margin-top:0.75rem;\"></p>
     </section>
     <section class=\"panel\">
-      <h2>Common Tasks</h2>
-      <p id=\"commonSummary\" class=\"empty-state\">Select two or more paths to see overlapping tasks.</p>
-      <ul id=\"commonTasks\" class=\"task-list\"></ul>
-    </section>
-    <section class=\"panel\">
-      <h2>Path Details</h2>
-      <div id=\"pathDetails\" class=\"empty-state\">Select a single path to view its tasks.</div>
+      <h2>Task Details</h2>
+      <div id=\"taskDetails\" class=\"empty-state\">Select a task to inspect its dependencies.</div>
     </section>
   </main>
   <script>
-    const pathsBody = document.getElementById('pathsBody');
-    const loadBtn = document.getElementById('loadBtn');
+    const tasksBody = document.getElementById('tasksBody');
+    const tasksStatus = document.getElementById('tasksStatus');
+    const taskDetails = document.getElementById('taskDetails');
+    const searchInput = document.getElementById('search');
     const limitInput = document.getElementById('limit');
-    const commonTasks = document.getElementById('commonTasks');
-    const commonSummary = document.getElementById('commonSummary');
-    const pathDetails = document.getElementById('pathDetails');
+    const loadBtn = document.getElementById('loadBtn');
+    const prevBtn = document.getElementById('prevBtn');
+    const nextBtn = document.getElementById('nextBtn');
 
-    let currentPaths = [];
+    let offset = 0;
+    let total = 0;
+    let currentSelection = null;
 
-    function ms(value) {
-      if (value == null) return '-';
-      return (value / 1e6).toFixed(3);
+    function formatNs(ns) {
+      if (typeof ns !== 'number') return '—';
+      return (ns / 1e6).toFixed(3);
     }
 
-    function renderPaths() {
-      pathsBody.innerHTML = '';
-      currentPaths.forEach((path, idx) => {
-        const tr = document.createElement('tr');
-        tr.classList.add('path-row');
-        tr.dataset.index = path.path_index;
-        tr.innerHTML = `
-          <td><input type="checkbox" data-index="${path.path_index}" /></td>
-          <td>${path.path_index}</td>
-          <td>${ms(path.total_duration_ns)}</td>
-          <td>${ms(path.slack_ns)}</td>
-          <td><span class="badge">${path.length ?? 0}</span></td>
-        `;
-        const checkbox = tr.querySelector('input[type="checkbox"]');
-        checkbox.addEventListener('change', () => {
-          updateCommonTasks();
-          highlightSelection();
+    function formatUs(ns) {
+      if (typeof ns !== 'number') return '—';
+      return (ns / 1e3).toFixed(2);
+    }
+
+    function updatePager() {
+      prevBtn.disabled = offset <= 0;
+      const limit = parseInt(limitInput.value, 10) || 50;
+      nextBtn.disabled = offset + limit >= total;
+      const end = Math.min(total, offset + limit);
+      if (total === 0) {
+        tasksStatus.textContent = 'No tasks found for the current filter.';
+      } else {
+        tasksStatus.textContent = `Showing ${offset + 1}–${end} of ${total} tasks.`;
+      }
+    }
+
+    function clearTasks() {
+      tasksBody.innerHTML = '';
+    }
+
+    function renderTasks(tasks) {
+      clearTasks();
+      tasks.forEach(task => {
+        const row = document.createElement('tr');
+        row.dataset.nodeId = task.node_id;
+        if (task.node_id === currentSelection) {
+          row.classList.add('selected');
+        }
+        const cells = [
+          task.node_id,
+          task.task_type,
+          task.layer_id,
+          task.task_id,
+          task.tile_id,
+          formatNs(task.start_time_ns),
+          formatUs(task.duration_ns),
+        ];
+        cells.forEach(text => {
+          const cell = document.createElement('td');
+          cell.textContent = text ?? '—';
+          row.appendChild(cell);
         });
-        tr.addEventListener('click', (event) => {
-          if (event.target.tagName.toLowerCase() === 'input') {
-            return;
-          }
-          pathsBody.querySelectorAll('tr').forEach(row => row.classList.remove('selected'));
-          tr.classList.add('selected');
-          loadPathDetails(path.path_index);
+        row.addEventListener('click', () => {
+          currentSelection = task.node_id;
+          document.querySelectorAll('tr.selected').forEach(el => el.classList.remove('selected'));
+          row.classList.add('selected');
+          loadTaskDetails(task.node_id);
         });
-        pathsBody.appendChild(tr);
+        tasksBody.appendChild(row);
       });
+      updatePager();
     }
 
-    function selectedIndices() {
-      return Array.from(pathsBody.querySelectorAll('input[type="checkbox"]'))
-        .filter(cb => cb.checked)
-        .map(cb => parseInt(cb.dataset.index, 10));
-    }
-
-    async function loadPaths() {
-      const limit = parseInt(limitInput.value, 10) || 10;
-      const response = await fetch(`/api/critical-paths?limit=${limit}`);
-      currentPaths = await response.json();
-      renderPaths();
-      updateCommonTasks();
-      pathDetails.innerHTML = 'Select a single path to view its tasks.';
-      pathDetails.className = 'empty-state';
-    }
-
-    async function loadPathDetails(pathIndex) {
-      const response = await fetch(`/api/critical-paths/${pathIndex}/tasks`);
-      const tasks = await response.json();
-      if (!tasks.length) {
-        pathDetails.innerHTML = 'No tasks found for this path.';
-        pathDetails.className = 'empty-state';
+    function renderDependencySection(container, title, items, roleLabel) {
+      const heading = document.createElement('h3');
+      heading.textContent = title;
+      container.appendChild(heading);
+      if (!items.length) {
+        const empty = document.createElement('p');
+        empty.className = 'empty-state';
+        empty.textContent = 'None';
+        container.appendChild(empty);
         return;
       }
       const list = document.createElement('ul');
-      list.className = 'task-list';
-      tasks.forEach(task => {
-        const li = document.createElement('li');
-        li.innerHTML = `<strong>${task.node_id}</strong> &mdash; ${task.task_type || 'unknown'} (Layer ${task.layer_id}, Task ${task.task_id}, Tile ${task.tile_id})<br />` +
-          `SM ${task.sm_id}, start ${ms(task.start_time_ns)} ms, duration ${ms(task.duration_ns)} ms`;
-        list.appendChild(li);
-      });
-      pathDetails.className = '';
-      pathDetails.innerHTML = '';
-      pathDetails.appendChild(list);
-    }
+      list.className = 'dependency-list';
+      items.forEach(item => {
+        const entry = document.createElement('li');
+        entry.className = 'dependency-item';
+        const header = document.createElement('h4');
+        const role = item[roleLabel];
+        header.textContent = `${role.node_id} • layer ${role.layer_id} task ${role.task_id} tile ${role.tile_id}`;
+        entry.appendChild(header);
 
-    async function updateCommonTasks() {
-      const indices = selectedIndices();
-      if (indices.length < 2) {
-        commonSummary.textContent = 'Select two or more paths to see overlapping tasks.';
-        commonSummary.className = 'empty-state';
-        commonTasks.innerHTML = '';
-        return;
-      }
-      const response = await fetch('/api/common-tasks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path_indices: indices })
-      });
-      const tasks = await response.json();
-      commonTasks.innerHTML = '';
-      if (!tasks.length) {
-        commonSummary.textContent = 'No common tasks between the selected paths.';
-        commonSummary.className = 'empty-state';
-        return;
-      }
-      commonSummary.textContent = `${tasks.length} common task(s) across paths ${indices.join(', ')}.`;
-      commonSummary.className = '';
-      tasks.forEach(task => {
-        const li = document.createElement('li');
-        li.innerHTML = `<strong>${task.node_id}</strong> &mdash; ${task.task_type || 'unknown'} (Layer ${task.layer_id}, Task ${task.task_id}, Tile ${task.tile_id})`;
-        commonTasks.appendChild(li);
-      });
-    }
+        const meta = document.createElement('div');
+        meta.textContent = `Tiles ${item.dependency.start_tile} – ${item.dependency.end_tile}`;
+        entry.appendChild(meta);
 
-    function highlightSelection() {
-      const indices = new Set(selectedIndices());
-      pathsBody.querySelectorAll('tr').forEach(row => {
-        if (indices.has(parseInt(row.dataset.index, 10))) {
-          row.classList.add('selected');
-        } else {
-          row.classList.remove('selected');
+        const origin = item.source;
+        const originInfo = document.createElement('div');
+        let originText = '';
+        if (origin.function) {
+          originText += `${origin.function} `;
         }
+        if (origin.requested_path) {
+          originText += origin.requested_path;
+        }
+        if (origin.lineno) {
+          originText += `:${origin.lineno}`;
+        }
+        if (!originText) {
+          originText = 'Origin unknown';
+        }
+        if (origin.error) {
+          originText += ` — ${origin.error}`;
+        }
+        originInfo.textContent = originText;
+        entry.appendChild(originInfo);
+
+        if (origin.source_line) {
+          const pre = document.createElement('pre');
+          pre.textContent = origin.source_line;
+          entry.appendChild(pre);
+        } else if (origin.code_context) {
+          const pre = document.createElement('pre');
+          pre.textContent = origin.code_context;
+          entry.appendChild(pre);
+        }
+        list.appendChild(entry);
       });
+      container.appendChild(list);
+    }
+
+    function renderTaskDetails(data) {
+      taskDetails.innerHTML = '';
+      if (!data || !data.task) {
+        taskDetails.className = 'empty-state';
+        taskDetails.textContent = 'Task not found.';
+        return;
+      }
+      taskDetails.className = '';
+
+      const title = document.createElement('h3');
+      title.textContent = data.task.node_id;
+      taskDetails.appendChild(title);
+
+      const metaGrid = document.createElement('div');
+      metaGrid.className = 'meta-grid';
+      const entries = [
+        ['Task type', data.task.task_type],
+        ['Layer', data.task.layer_id],
+        ['Task id', data.task.task_id],
+        ['Tile', data.task.tile_id],
+        ['Start (ns)', data.task.start_time_ns],
+        ['Duration (ns)', data.task.duration_ns],
+        ['Finish (ns)', data.task.finish_time_ns],
+        ['SM id', data.task.sm_id],
+      ];
+      entries.forEach(([label, value]) => {
+        const card = document.createElement('div');
+        card.className = 'meta-card';
+        const span = document.createElement('span');
+        span.textContent = label;
+        const strong = document.createElement('strong');
+        strong.textContent = value ?? '—';
+        card.appendChild(span);
+        card.appendChild(strong);
+        metaGrid.appendChild(card);
+      });
+      taskDetails.appendChild(metaGrid);
+
+      renderDependencySection(taskDetails, 'Input dependencies', data.inputs || [], 'producer');
+      renderDependencySection(taskDetails, 'Dependents', data.dependents || [], 'consumer');
+    }
+
+    async function loadTasks() {
+      const limit = parseInt(limitInput.value, 10) || 50;
+      const params = new URLSearchParams();
+      params.set('limit', limit);
+      params.set('offset', offset);
+      const search = searchInput.value.trim();
+      if (search) {
+        params.set('q', search);
+      }
+      const response = await fetch(`/api/tasks?${params.toString()}`);
+      if (!response.ok) {
+        tasksStatus.textContent = 'Failed to load tasks.';
+        return;
+      }
+      const data = await response.json();
+      total = data.total;
+      offset = data.offset;
+      renderTasks(data.tasks);
+    }
+
+    async function loadTaskDetails(nodeId) {
+      const response = await fetch(`/api/task/${encodeURIComponent(nodeId)}`);
+      if (!response.ok) {
+        taskDetails.className = 'empty-state';
+        taskDetails.textContent = 'Failed to load task details.';
+        return;
+      }
+      const data = await response.json();
+      renderTaskDetails(data);
     }
 
     loadBtn.addEventListener('click', () => {
-      loadPaths();
+      offset = 0;
+      loadTasks();
+    });
+    prevBtn.addEventListener('click', () => {
+      const limit = parseInt(limitInput.value, 10) || 50;
+      offset = Math.max(0, offset - limit);
+      loadTasks();
+    });
+    nextBtn.addEventListener('click', () => {
+      const limit = parseInt(limitInput.value, 10) || 50;
+      offset = offset + limit;
+      loadTasks();
     });
 
-    loadPaths();
+    window.addEventListener('DOMContentLoaded', () => {
+      loadTasks();
+    });
   </script>
 </body>
 </html>
 """
 
 
-def make_handler(service: CriticalPathService):
+def make_handler(service: DependencyTraceService):
     class _Handler(BaseHTTPRequestHandler):
-        def _write_json(self, payload, status: int = 200) -> None:
-            data = json.dumps(payload).encode("utf-8")
+        def _write_json(self, payload: Dict[str, object], status: int = 200) -> None:
+            body = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(data)
+            self.wfile.write(body)
 
-        def do_GET(self):  # noqa: N802 (BaseHTTPRequestHandler API)
+        def do_GET(self):  # noqa: N802
             parsed = urlparse(self.path)
             if parsed.path == "/":
                 body = HTML_PAGE.encode("utf-8")
@@ -667,79 +853,58 @@ def make_handler(service: CriticalPathService):
                 self.end_headers()
                 self.wfile.write(body)
                 return
-            if parsed.path == "/api/critical-paths":
-                query = parse_qs(parsed.query)
-                limit = 10
-                if "limit" in query:
-                    try:
-                        limit = max(1, min(500, int(query["limit"][0])))
-                    except (ValueError, TypeError):
-                        pass
-                paths = service.top_paths(limit)
-                self._write_json(paths)
-                return
-            if parsed.path.startswith("/api/critical-paths/"):
+            if parsed.path == "/api/tasks":
+                qs = parse_qs(parsed.query or "")
                 try:
-                    path_index = int(parsed.path.rsplit("/", 1)[-1])
+                    limit = int(qs.get("limit", ["50"])[0])
                 except ValueError:
-                    self._write_json({"error": "invalid path index"}, status=400)
+                    self._write_json({"error": "limit must be an integer"}, status=400)
                     return
-                tasks = service.path_tasks(path_index)
-                self._write_json(tasks)
+                try:
+                    offset = int(qs.get("offset", ["0"])[0])
+                except ValueError:
+                    self._write_json({"error": "offset must be an integer"}, status=400)
+                    return
+                limit = max(1, min(limit, 500))
+                offset = max(0, offset)
+                query = qs.get("q", [""])[0]
+                payload = service.list_tasks(limit=limit, offset=offset, query=query)
+                self._write_json(payload)
+                return
+            if parsed.path.startswith("/api/task/"):
+                node_id = parsed.path[len("/api/task/") :]
+                try:
+                    node_id = parse_qs(f"node={node_id}")["node"][0]
+                except Exception:  # noqa: BLE001 - defensive parsing
+                    pass
+                detail = service.task_detail(node_id)
+                if detail is None:
+                    self._write_json({"error": "task not found"}, status=404)
+                else:
+                    self._write_json(detail)
                 return
             self._write_json({"error": "not found"}, status=404)
 
-        def do_POST(self):  # noqa: N802 (BaseHTTPRequestHandler API)
-            parsed = urlparse(self.path)
-            if parsed.path != "/api/common-tasks":
-                self._write_json({"error": "not found"}, status=404)
-                return
-            length = int(self.headers.get("Content-Length", "0"))
-            payload = self.rfile.read(length)
-            try:
-                body = json.loads(payload or b"{}")
-            except json.JSONDecodeError:
-                self._write_json({"error": "invalid json"}, status=400)
-                return
-            indices = body.get("path_indices", [])
-            try:
-                normalized = [int(x) for x in indices]
-            except (TypeError, ValueError):
-                self._write_json({"error": "path_indices must be integers"}, status=400)
-                return
-            tasks = service.common_tasks(normalized)
-            self._write_json(tasks)
-
-        def log_message(self, format, *args):  # noqa: A003 - follow BaseHTTPRequestHandler signature
-            sys.stderr.write("[critical_path_server] " + (format % args) + "\n")
+        def log_message(self, format, *args):  # noqa: A003
+            sys.stderr.write("[dependency_trace_server] " + (format % args) + "\n")
 
     return _Handler
 
 
+# --------------------------------------------------------------------------------------
+# CLI entry point
+# --------------------------------------------------------------------------------------
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Explore dependency trace critical paths")
+    parser = argparse.ArgumentParser(description="Serve an inspector for dependency traces")
     parser.add_argument("--trace", required=True, help="Path to dependency trace JSON file")
     parser.add_argument(
         "--database",
-        help="Optional path to a SQLite database for caching the ingested trace",
-    )
-    parser.add_argument(
-        "--top",
-        type=int,
-        help="Print the top N critical paths to stdout and exit",
-    )
-    parser.add_argument(
-        "--common",
-        nargs="*",
-        help="Print tasks common to the specified critical path indices and exit",
-    )
-    parser.add_argument(
-        "--serve",
-        action="store_true",
-        help="Start an HTTP server with a browser UI after ingesting the trace",
+        help="Optional path to a SQLite database used to cache the ingested trace",
     )
     parser.add_argument("--host", default="127.0.0.1", help="Host address for the HTTP server")
-    parser.add_argument("--port", type=int, default=8765, help="Port for the HTTP server")
+    parser.add_argument("--port", type=int, default=8765, help="Port number for the HTTP server")
     return parser.parse_args(argv)
 
 
@@ -751,7 +916,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     if args.database:
         db_path = Path(args.database)
     else:
-        db_fd, db_name = tempfile.mkstemp(prefix="critical_paths_", suffix=".sqlite3")
+        db_fd, db_name = tempfile.mkstemp(prefix="dependency_trace_", suffix=".sqlite3")
         os.close(db_fd)
         db_path = Path(db_name)
     conn = sqlite3.connect(str(db_path))
@@ -760,39 +925,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     finally:
         conn.close()
 
-    service = CriticalPathService(db_path)
-
-    if args.top:
-        top_paths = service.top_paths(args.top)
-        for row in top_paths:
-            print(
-                f"Path {row['path_index']}: duration={row['total_duration_ns']} ns, "
-                f"slack={row['slack_ns']} ns, tasks={row['length']}"
-            )
-    if args.common:
-        try:
-            indices = [int(idx) for idx in args.common]
-        except ValueError:
-            raise SystemExit("All --common values must be integers")
-        tasks = service.common_tasks(indices)
-        if not tasks:
-            print("No common tasks across the specified critical paths.")
-        else:
-            print(f"Common tasks for paths {', '.join(map(str, indices))}:")
-            for task in tasks:
-                print(
-                    f"  {task['node_id']} type={task['task_type']} layer={task['layer_id']} "
-                    f"task={task['task_id']} tile={task['tile_id']}"
-                )
-    if not args.serve:
-        if not args.database:
-            with contextlib.suppress(FileNotFoundError):
-                os.remove(db_path)
-        return
-
+    service = DependencyTraceService(db_path, trace_path)
     handler_cls = make_handler(service)
     server = ThreadingHTTPServer((args.host, args.port), handler_cls)
-    print(f"Serving critical path explorer on http://{args.host}:{args.port}")
+    print(f"Serving dependency trace inspector on http://{args.host}:{args.port}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -806,4 +942,3 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
