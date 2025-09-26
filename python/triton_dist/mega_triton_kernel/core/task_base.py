@@ -30,6 +30,8 @@ from .config import ConfigBase
 import torch
 from .utils import has_slice_intersection
 
+_DEFAULT_DEP_ORIGIN_BASE = os.environ.get("MEGAKERNEL_DEP_TRACE_BASE")
+
 # To satisfy the alignment requirement of tensor data_ptr, MAX_NUM_TENSOR_DIMS must be an even number.
 MAX_NUM_TENSOR_DIMS = 4
 
@@ -118,6 +120,63 @@ class DependencyOrigin:
     function: str
     code_context: Optional[str] = None
 
+    @classmethod
+    def capture(
+        cls,
+        skip_modules: Tuple[str, ...] = ("task_base.py", "graph.py"),
+        base_dir: Optional[str] = None,
+    ) -> Optional["DependencyOrigin"]:
+        """Capture the first caller frame outside the helper modules.
+
+        Args:
+            skip_modules: File name suffixes that should be skipped when walking the
+                stack so we don't report helper utilities as the origin of the
+                dependency edge.
+            base_dir: Optional directory to which captured paths should be made
+                relative. When provided, the returned ``filename`` is the relative
+                path if possible; otherwise the absolute path is used.
+        """
+
+        frame = inspect.currentframe()
+        if frame is None:
+            return None
+        try:
+            caller = frame.f_back
+            if caller is None:
+                return None
+            target = caller.f_back
+            while target is not None:
+                filename = os.path.abspath(target.f_code.co_filename)
+                if not any(filename.endswith(mod) for mod in skip_modules):
+                    code_line = inspect.getframeinfo(target).code_context
+                    code_context = code_line[0].strip() if code_line else None
+                    if base_dir is not None:
+                        try:
+                            rel_path = os.path.relpath(filename, start=base_dir)
+                            # Avoid introducing ".." prefixes for unrelated paths
+                            if not rel_path.startswith(".."):
+                                filename_to_report = rel_path
+                            else:
+                                filename_to_report = filename
+                        except ValueError:
+                            filename_to_report = filename
+                    else:
+                        filename_to_report = filename
+                    return cls(
+                        filename=filename_to_report,
+                        lineno=target.f_lineno,
+                        function=target.f_code.co_name,
+                        code_context=code_context,
+                    )
+                target = target.f_back
+            return None
+        finally:
+            del frame
+            if "caller" in locals():
+                del caller
+            if "target" in locals():
+                del target
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "filename": self.filename,
@@ -125,37 +184,6 @@ class DependencyOrigin:
             "function": self.function,
             "code_context": self.code_context,
         }
-
-
-def _capture_dependency_origin(skip_modules: Tuple[str, ...] = ("task_base.py", "graph.py")) -> Optional[DependencyOrigin]:
-    """Capture the first caller frame outside the helper modules."""
-    frame = inspect.currentframe()
-    if frame is None:
-        return None
-    try:
-        caller = frame.f_back
-        if caller is None:
-            return None
-        target = caller.f_back
-        while target is not None:
-            filename = os.path.abspath(target.f_code.co_filename)
-            if not any(filename.endswith(mod) for mod in skip_modules):
-                code_line = inspect.getframeinfo(target).code_context
-                code_context = code_line[0].strip() if code_line else None
-                return DependencyOrigin(
-                    filename=filename,
-                    lineno=target.f_lineno,
-                    function=target.f_code.co_name,
-                    code_context=code_context,
-                )
-            target = target.f_back
-        return None
-    finally:
-        del frame
-        if 'caller' in locals():
-            del caller
-        if 'target' in locals():
-            del target
 
 
 @dataclass
@@ -200,7 +228,15 @@ class InputDependencyDesc:
     require_full: bool = True
     origin: Optional[DependencyOrigin] = None
 
-    def __init__(self, input, require_full=True, start_indices: Tuple[int] = (), data_sizes: Tuple[int] = ()):
+    def __init__(
+        self,
+        input,
+        require_full: bool = True,
+        start_indices: Tuple[int] = (),
+        data_sizes: Tuple[int] = (),
+        origin: Optional[DependencyOrigin] = None,
+        capture_origin: bool = True,
+    ):
         self.input = input
         self.require_full = require_full
         if require_full:
@@ -209,7 +245,12 @@ class InputDependencyDesc:
         else:
             self.start_indices = start_indices
             self.data_sizes = data_sizes
-        self.origin = _capture_dependency_origin()
+        if origin is not None:
+            self.origin = origin
+        elif capture_origin:
+            self.origin = DependencyOrigin.capture(base_dir=_DEFAULT_DEP_ORIGIN_BASE)
+        else:
+            self.origin = None
 
 
 @dataclass

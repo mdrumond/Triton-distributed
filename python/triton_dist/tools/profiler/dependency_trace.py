@@ -25,8 +25,11 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional, Any, Iterable
+
+from triton_dist.models.utils import logger as mega_logger
 
 import torch
 
@@ -83,6 +86,7 @@ class DependencyTraceBuilder:
         wq_tensor: torch.Tensor,
         num_tasks_tensor: torch.Tensor,
         scheduled_tasks: Iterable["TaskBase"],
+        base_dir: Optional[str] = None,
     ) -> None:
         self._profiler_buffer = profiler_buffer
         self._task_types_to_str = task_types_to_str
@@ -97,7 +101,8 @@ class DependencyTraceBuilder:
         self._path_finish_time: Dict[str, int] = {}
         self._pred: Dict[str, Optional[str]] = {}
         self._min_start_time: int = 0
-        self._logical_to_key: Dict[Tuple[int, int, int], Tuple[int, int, int, int]] = {}
+        self._logical_to_key: Dict[Tuple[int, int, int], List[Tuple[int, int, int, int]]] = {}
+        self._base_dir = base_dir
 
     # ---------------------------- helpers ---------------------------------
     def _build_task_lookup(self) -> None:
@@ -110,11 +115,7 @@ class DependencyTraceBuilder:
                 )
             self._task_lookup[key] = task
             logical_key = (task.layer_id, task.task_id, task.tile_id_or_start)
-            if logical_key in self._logical_to_key:
-                raise RuntimeError(
-                    f"Duplicate logical task key {logical_key} encountered when building dependency trace."
-                )
-            self._logical_to_key[logical_key] = key
+            self._logical_to_key.setdefault(logical_key, []).append(key)
 
     def _decode_work_queues(self) -> Dict[int, List[Tuple[int, int, int, int]]]:
         wq_host = self._wq_tensor.cpu()
@@ -160,14 +161,45 @@ class DependencyTraceBuilder:
         for sm_id, scheduled in decoded_wq.items():
             events = profiled_events.get(sm_id, [])
             if len(events) != len(scheduled):
-                raise RuntimeError(
-                    f"Mismatch between profiled events ({len(events)}) and scheduled tasks ({len(scheduled)}) for SM {sm_id}."
+                mega_logger.log(
+                    (
+                        "Profiler events (%d) did not match scheduled tasks (%d) for SM %d. "
+                        "Attempting best-effort alignment."
+                    )
+                    % (len(events), len(scheduled), sm_id),
+                    level="warning",
                 )
-            for entry, event in zip(scheduled, events):
+            event_idx = 0
+            for entry in scheduled:
                 key = entry
                 task = self._task_lookup.get(key, None)
                 if task is None:
-                    raise RuntimeError(f"Unable to map scheduled task {key} to TaskBase instance.")
+                    mega_logger.log(
+                        f"Unable to map scheduled task {key} to TaskBase instance; skipping.",
+                        level="warning",
+                    )
+                    continue
+                event = None
+                while event_idx < len(events):
+                    candidate = events[event_idx]
+                    event_idx += 1
+                    if candidate.task_type == key[0]:
+                        event = candidate
+                        break
+                    mega_logger.log(
+                        (
+                            "Dropping profiler event with task_type %d while aligning SM %d "
+                            "because it does not match scheduled task %s."
+                        )
+                        % (candidate.task_type, sm_id, key),
+                        level="warning",
+                    )
+                if event is None:
+                    mega_logger.log(
+                        f"No profiler event available for scheduled task {key} on SM {sm_id}; skipping node.",
+                        level="warning",
+                    )
+                    continue
                 node_id = self._create_node_id(*key)
                 start_time_ns = int(event.start_time)
                 duration_ns = int(event.duration)
@@ -187,7 +219,10 @@ class DependencyTraceBuilder:
                     absolute_start_time_ns=start_time_ns,
                 )
         if not all_start_times:
-            raise RuntimeError("Profiler trace buffer did not contain any task events.")
+            raise RuntimeError(
+                "Profiler trace buffer did not contain any task events after alignment; "
+                "ensure profiling is enabled and the dependency trace is exported post-run."
+            )
         self._min_start_time = min(all_start_times)
         for node in self._task_nodes.values():
             relative_start = node.start_time_ns - self._min_start_time
@@ -206,28 +241,55 @@ class DependencyTraceBuilder:
                 reverse_adj[node_id] = []
             for dep in task.dependency:
                 assert isinstance(dep, TaskDependency)
+                producer_keys: List[Tuple[int, int, int, int]] = []
                 for tile_id in range(dep.start_tiles, dep.end_tiles):
                     logical_key = (dep.layer_id, dep.task_id, tile_id)
-                    producer_key = self._logical_to_key.get(logical_key)
-                    if producer_key is None:
-                        continue
+                    producer_keys = self._logical_to_key.get(logical_key, [])
+                    if producer_keys:
+                        break
+                if not producer_keys:
+                    mega_logger.log(
+                        f"Failed to find producer for dependency {dep} on task {node_id}; skipping edge.",
+                        level="warning",
+                    )
+                    continue
+                found_src = False
+                for producer_key in producer_keys:
                     src_id = self._create_node_id(*producer_key)
                     if src_id not in self._task_nodes:
                         continue
                     edge_key = (src_id, node_id, dep.start_tiles, dep.end_tiles)
                     if edge_key in edge_keys:
-                        continue
+                        found_src = True
+                        break
                     edge_keys.add(edge_key)
+                    origin_dict = dep.origin.to_dict() if dep.origin else None
+                    if origin_dict and self._base_dir:
+                        filename = origin_dict.get("filename")
+                        if filename:
+                            try:
+                                rel = os.path.relpath(filename, start=self._base_dir)
+                                if not rel.startswith(".."):
+                                    origin_dict["filename"] = rel
+                            except ValueError:
+                                pass
                     edge = TraceDependency(
                         src=src_id,
                         dst=node_id,
                         start_tile=dep.start_tiles,
                         end_tile=dep.end_tiles,
-                        origin=dep.origin.to_dict() if dep.origin else None,
+                        origin=origin_dict,
                     )
                     self._edges.append(edge)
                     adjacency.setdefault(src_id, []).append(node_id)
                     reverse_adj.setdefault(node_id, []).append(src_id)
+                    found_src = True
+                    break
+                if not found_src:
+                    mega_logger.log(
+                        f"Unable to map dependency {dep} for task {node_id} to profiled producer; skipping edge.",
+                        level="warning",
+                    )
         self._graph = adjacency
         self._reverse_graph = reverse_adj
 
@@ -320,6 +382,7 @@ def export_dependency_trace(
     num_tasks_tensor: torch.Tensor,
     scheduled_tasks: Iterable["TaskBase"],
     max_paths: int = 5,
+    base_dir: Optional[str] = None,
 ) -> str:
     if not trace_file.endswith(".json"):
         trace_file = f"{trace_file}.json"
@@ -329,6 +392,7 @@ def export_dependency_trace(
         wq_tensor=wq_tensor,
         num_tasks_tensor=num_tasks_tensor,
         scheduled_tasks=scheduled_tasks,
+        base_dir=base_dir,
     )
     data = builder.build(max_paths=max_paths)
     with open(trace_file, "w", encoding="utf-8") as f:
