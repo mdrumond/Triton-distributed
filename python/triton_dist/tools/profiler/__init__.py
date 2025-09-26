@@ -25,14 +25,15 @@
 
 from .language import Profiler
 from .viewer import export_to_perfetto_trace, parse_to_tracks
+from .dependency_trace import export_dependency_trace
 from .context import ProfilerBuffer, alloc_profiler_buffer, reset_profiler_buffer
 
 __all__ = [
     "Profiler",
     "alloc_profiler_buffer",
     "export_to_perfetto_trace",
-    "alloc_profiler_buffer",
     "ProfilerBuffer",
     "reset_profiler_buffer",
     "parse_to_tracks",
+    "export_dependency_trace",
 ]

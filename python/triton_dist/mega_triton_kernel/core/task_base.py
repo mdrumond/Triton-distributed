@@ -24,6 +24,8 @@
 ################################################################################
 from typing import Dict, Type, List, Any, Tuple, Union, Optional
 from dataclasses import dataclass, field
+import inspect
+import os
 from .config import ConfigBase
 import torch
 from .utils import has_slice_intersection
@@ -110,17 +112,67 @@ class TaskIDManager:
 
 
 @dataclass
+class DependencyOrigin:
+    filename: str
+    lineno: int
+    function: str
+    code_context: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "filename": self.filename,
+            "lineno": self.lineno,
+            "function": self.function,
+            "code_context": self.code_context,
+        }
+
+
+def _capture_dependency_origin(skip_modules: Tuple[str, ...] = ("task_base.py", "graph.py")) -> Optional[DependencyOrigin]:
+    """Capture the first caller frame outside the helper modules."""
+    frame = inspect.currentframe()
+    if frame is None:
+        return None
+    try:
+        caller = frame.f_back
+        if caller is None:
+            return None
+        target = caller.f_back
+        while target is not None:
+            filename = os.path.abspath(target.f_code.co_filename)
+            if not any(filename.endswith(mod) for mod in skip_modules):
+                code_line = inspect.getframeinfo(target).code_context
+                code_context = code_line[0].strip() if code_line else None
+                return DependencyOrigin(
+                    filename=filename,
+                    lineno=target.f_lineno,
+                    function=target.f_code.co_name,
+                    code_context=code_context,
+                )
+            target = target.f_back
+        return None
+    finally:
+        del frame
+        if 'caller' in locals():
+            del caller
+        if 'target' in locals():
+            del target
+
+
+@dataclass
 class TaskDependency:
     layer_id: int
     task_id: int
     start_tiles: int  # include
     end_tiles: int  # exclude
+    origin: Optional[DependencyOrigin] = None
 
-    def __init__(self, layer_id=-1, task_id=-1, start_tiles=0, end_tiles=0):
+    def __init__(self, layer_id: int = -1, task_id: int = -1, start_tiles: int = 0, end_tiles: int = 0,
+                 origin: Optional[DependencyOrigin] = None):
         self.layer_id = layer_id
         self.task_id = task_id
         self.start_tiles = start_tiles
         self.end_tiles = end_tiles
+        self.origin = origin
 
     def cover(self, other):
         return other.layer_id == self.layer_id and other.task_id == self.task_id and other.start_tiles >= self.start_tiles and other.end_tiles <= self.end_tiles
@@ -146,6 +198,7 @@ class InputDependencyDesc:
     data_sizes: Tuple[int]
     # only require_full == false, start_indices/data_sizes are valid
     require_full: bool = True
+    origin: Optional[DependencyOrigin] = None
 
     def __init__(self, input, require_full=True, start_indices: Tuple[int] = (), data_sizes: Tuple[int] = ()):
         self.input = input
@@ -156,6 +209,7 @@ class InputDependencyDesc:
         else:
             self.start_indices = start_indices
             self.data_sizes = data_sizes
+        self.origin = _capture_dependency_origin()
 
 
 @dataclass
