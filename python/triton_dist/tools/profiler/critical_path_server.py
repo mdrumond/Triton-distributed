@@ -362,7 +362,7 @@ class DependencyTraceService:
         self._db_path = db_path
         self._trace_path = trace_path
         self._metadata_cache: Optional[Dict[str, Optional[str]]] = None
-        self._repo_root = _detect_repo_root(trace_path.parent)
+        self._repo_root = _detect_repo_root() or _detect_repo_root(trace_path.parent)
 
     @contextlib.contextmanager
     def _connection(self):
@@ -399,10 +399,6 @@ class DependencyTraceService:
             return os.path.abspath(filename)
 
         candidates: List[Path] = []
-
-        env_root = os.environ.get("TRITON_DISTRIBUTED_SOURCE_ROOT")
-        if env_root:
-            candidates.append(Path(env_root) / filename)
 
         if self._repo_root:
             candidates.append(self._repo_root / filename)
