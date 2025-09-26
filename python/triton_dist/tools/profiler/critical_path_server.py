@@ -202,6 +202,7 @@ def initialise_database(conn: sqlite3.Connection) -> None:
             task_id INTEGER,
             tile_id INTEGER,
             sm_id INTEGER,
+            rank INTEGER,
             start_time_ns INTEGER,
             duration_ns INTEGER,
             finish_time_ns INTEGER,
@@ -214,6 +215,8 @@ def initialise_database(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS dependencies (
             src TEXT,
             dst TEXT,
+            src_rank INTEGER,
+            dst_rank INTEGER,
             start_tile INTEGER,
             end_tile INTEGER,
             origin_filename TEXT,
@@ -264,6 +267,7 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
                             task_id,
                             tile_id,
                             sm_id,
+                            rank,
                             start_time_ns,
                             duration_ns,
                             finish_time_ns,
@@ -278,6 +282,7 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
                             obj.get("task_id"),
                             obj.get("tile_id"),
                             obj.get("sm_id"),
+                            obj.get("rank"),
                             obj.get("start_time_ns"),
                             obj.get("duration_ns"),
                             obj.get("finish_time_ns"),
@@ -293,6 +298,8 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
                         INSERT INTO dependencies (
                             src,
                             dst,
+                            src_rank,
+                            dst_rank,
                             start_tile,
                             end_tile,
                             origin_filename,
@@ -304,6 +311,8 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
                         (
                             obj.get("src"),
                             obj.get("dst"),
+                            obj.get("src_rank"),
+                            obj.get("dst_rank"),
                             obj.get("start_tile"),
                             obj.get("end_tile"),
                             (obj.get("origin") or {}).get("filename"),
@@ -324,6 +333,18 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
                 conn.execute(
                     "INSERT INTO metadata (key, value) VALUES (?, ?)",
                     ("origin_base_dir", json.dumps(value)),
+                )
+            elif key == "rank":
+                value = _read_scalar(fp)
+                conn.execute(
+                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                    ("rank", json.dumps(value)),
+                )
+            elif key == "world_size":
+                value = _read_scalar(fp)
+                conn.execute(
+                    "INSERT INTO metadata (key, value) VALUES (?, ?)",
+                    ("world_size", json.dumps(value)),
                 )
             else:
                 _skip_value(fp)
@@ -449,7 +470,7 @@ class DependencyTraceService:
             total_cursor = conn.execute(f"SELECT COUNT(*) FROM tasks {where_clause}", params)
             total = int(total_cursor.fetchone()[0])
             query_sql = (
-                "SELECT node_id, task_type, task_type_id, layer_id, task_id, tile_id, sm_id, "
+                "SELECT node_id, task_type, task_type_id, layer_id, task_id, tile_id, sm_id, rank, "
                 "start_time_ns, duration_ns, finish_time_ns, absolute_start_time_ns "
                 f"FROM tasks {where_clause} ORDER BY start_time_ns ASC LIMIT ? OFFSET ?"
             )
@@ -466,6 +487,7 @@ class DependencyTraceService:
             "task_id": row[f"{prefix}_task_id"],
             "tile_id": row[f"{prefix}_tile_id"],
             "sm_id": row[f"{prefix}_sm_id"],
+            "rank": row[f"{prefix}_rank"],
             "start_time_ns": row[f"{prefix}_start_time_ns"],
             "duration_ns": row[f"{prefix}_duration_ns"],
             "finish_time_ns": row[f"{prefix}_finish_time_ns"],
@@ -475,13 +497,14 @@ class DependencyTraceService:
     def _collect_dependencies(self, conn: sqlite3.Connection, node_id: str, incoming: bool) -> List[Dict[str, object]]:
         if incoming:
             query = (
-                "SELECT d.src, d.dst, d.start_tile, d.end_tile, d.origin_filename, d.origin_lineno, "
-                "d.origin_function, d.origin_code_context, "
+                "SELECT d.src, d.dst, d.src_rank, d.dst_rank, d.start_tile, d.end_tile, d.origin_filename, "
+                "d.origin_lineno, d.origin_function, d.origin_code_context, "
                 "t.node_id AS producer_node_id, t.task_type AS producer_task_type, "
                 "t.task_type_id AS producer_task_type_id, t.layer_id AS producer_layer_id, "
                 "t.task_id AS producer_task_id, t.tile_id AS producer_tile_id, t.sm_id AS producer_sm_id, "
-                "t.start_time_ns AS producer_start_time_ns, t.duration_ns AS producer_duration_ns, "
-                "t.finish_time_ns AS producer_finish_time_ns, t.absolute_start_time_ns AS producer_absolute_start_time_ns "
+                "t.rank AS producer_rank, t.start_time_ns AS producer_start_time_ns, "
+                "t.duration_ns AS producer_duration_ns, t.finish_time_ns AS producer_finish_time_ns, "
+                "t.absolute_start_time_ns AS producer_absolute_start_time_ns "
                 "FROM dependencies d "
                 "JOIN tasks t ON t.node_id = d.src "
                 "WHERE d.dst = ? "
@@ -490,13 +513,14 @@ class DependencyTraceService:
             role_key = "producer"
         else:
             query = (
-                "SELECT d.src, d.dst, d.start_tile, d.end_tile, d.origin_filename, d.origin_lineno, "
-                "d.origin_function, d.origin_code_context, "
+                "SELECT d.src, d.dst, d.src_rank, d.dst_rank, d.start_tile, d.end_tile, d.origin_filename, "
+                "d.origin_lineno, d.origin_function, d.origin_code_context, "
                 "t.node_id AS consumer_node_id, t.task_type AS consumer_task_type, "
                 "t.task_type_id AS consumer_task_type_id, t.layer_id AS consumer_layer_id, "
                 "t.task_id AS consumer_task_id, t.tile_id AS consumer_tile_id, t.sm_id AS consumer_sm_id, "
-                "t.start_time_ns AS consumer_start_time_ns, t.duration_ns AS consumer_duration_ns, "
-                "t.finish_time_ns AS consumer_finish_time_ns, t.absolute_start_time_ns AS consumer_absolute_start_time_ns "
+                "t.rank AS consumer_rank, t.start_time_ns AS consumer_start_time_ns, "
+                "t.duration_ns AS consumer_duration_ns, t.finish_time_ns AS consumer_finish_time_ns, "
+                "t.absolute_start_time_ns AS consumer_absolute_start_time_ns "
                 "FROM dependencies d "
                 "JOIN tasks t ON t.node_id = d.dst "
                 "WHERE d.src = ? "
@@ -509,6 +533,8 @@ class DependencyTraceService:
             dependency = {
                 "src": row["src"],
                 "dst": row["dst"],
+                "src_rank": row["src_rank"],
+                "dst_rank": row["dst_rank"],
                 "start_tile": row["start_tile"],
                 "end_tile": row["end_tile"],
                 "origin": {
@@ -538,7 +564,7 @@ class DependencyTraceService:
     def task_detail(self, node_id: str) -> Optional[Dict[str, object]]:
         with self._connection() as conn:
             row = conn.execute(
-                "SELECT node_id, task_type, task_type_id, layer_id, task_id, tile_id, sm_id, "
+                "SELECT node_id, task_type, task_type_id, layer_id, task_id, tile_id, sm_id, rank, "
                 "start_time_ns, duration_ns, finish_time_ns, absolute_start_time_ns FROM tasks WHERE node_id = ?",
                 (node_id,),
             ).fetchone()

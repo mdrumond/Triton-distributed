@@ -45,6 +45,7 @@ from triton_dist.mega_triton_kernel.core.task_base import (
 @dataclass
 class TraceTask:
     node_id: str
+    rank: int
     task_type: str
     task_type_id: int
     layer_id: int
@@ -64,6 +65,8 @@ class TraceTask:
 class TraceDependency:
     src: str
     dst: str
+    src_rank: int
+    dst_rank: int
     start_tile: int
     end_tile: int
     origin: Optional[Dict[str, Any]]
@@ -80,6 +83,8 @@ class DependencyTraceBuilder:
         wq_tensor: torch.Tensor,
         num_tasks_tensor: torch.Tensor,
         scheduled_tasks: Iterable["TaskBase"],
+        rank: int,
+        world_size: Optional[int] = None,
         base_dir: Optional[str] = None,
     ) -> None:
         self._profiler_buffer = profiler_buffer
@@ -93,6 +98,8 @@ class DependencyTraceBuilder:
         self._min_start_time: int = 0
         self._logical_to_key: Dict[Tuple[int, int, int], List[Tuple[int, int, int, int]]] = {}
         self._base_dir = base_dir
+        self._rank = rank
+        self._world_size = world_size
 
     # ---------------------------- helpers ---------------------------------
     def _build_task_lookup(self) -> None:
@@ -197,6 +204,7 @@ class DependencyTraceBuilder:
                 finish_time_ns = start_time_ns + duration_ns
                 self._task_nodes[node_id] = TraceTask(
                     node_id=node_id,
+                    rank=self._rank,
                     task_type=self._task_types_to_str.get(key[0], f"task_{key[0]}"),
                     task_type_id=key[0],
                     layer_id=key[1],
@@ -260,6 +268,8 @@ class DependencyTraceBuilder:
                     edge = TraceDependency(
                         src=src_id,
                         dst=node_id,
+                        src_rank=self._rank,
+                        dst_rank=self._rank,
                         start_tile=dep.start_tiles,
                         end_tile=dep.end_tiles,
                         origin=origin_dict,
@@ -288,6 +298,8 @@ class DependencyTraceBuilder:
             "dependencies": [edge.to_dict() for edge in edges_sorted],
             "min_start_time_ns": self._min_start_time,
             "origin_base_dir": self._base_dir,
+            "rank": self._rank,
+            "world_size": self._world_size,
         }
 
 
@@ -298,6 +310,8 @@ def export_dependency_trace(
     wq_tensor: torch.Tensor,
     num_tasks_tensor: torch.Tensor,
     scheduled_tasks: Iterable["TaskBase"],
+    rank: int,
+    world_size: Optional[int],
     base_dir: Optional[str] = None,
 ) -> str:
     if not trace_file.endswith(".json"):
@@ -310,6 +324,8 @@ def export_dependency_trace(
         wq_tensor=wq_tensor,
         num_tasks_tensor=num_tasks_tensor,
         scheduled_tasks=scheduled_tasks,
+        rank=rank,
+        world_size=world_size,
         base_dir=base_dir,
     )
     data = builder.build()
