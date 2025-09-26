@@ -48,11 +48,11 @@ def _list_to_intervals(nums):
     return intervals
 
 
-def _deps_list_to_dependency(deps_list, layer_id, task_id):
+def _deps_list_to_dependency(deps_list, layer_id, task_id, origin=None):
     intervals = _list_to_intervals(deps_list)
     ret = []
     for l, r in intervals:
-        ret.append(TaskDependency(layer_id=layer_id, task_id=task_id, start_tiles=l, end_tiles=r))
+        ret.append(TaskDependency(layer_id=layer_id, task_id=task_id, start_tiles=l, end_tiles=r, origin=origin))
     return ret
 
 
@@ -142,12 +142,15 @@ class Graph:
                     if len(producer_tasks_list) > 0:
 
                         deps_tile_ids_from_cur_producer = []
+                        input_dep_desc = cur_task.get_input_dep_desc(input_idx)
+                        origin = input_dep_desc.origin if input_dep_desc is not None else None
                         for producer_task in producer_tasks_list:
                             if cur_task.has_data_dependency(producer_task, src_out_idx, input_idx):
                                 deps_tile_ids_from_cur_producer.append(producer_task.tile_id_or_start)
                         task_deps_cur_task += _deps_list_to_dependency(deps_tile_ids_from_cur_producer,
                                                                        layer_id=producer_tasks_list[0].layer_id,
-                                                                       task_id=producer_tasks_list[0].task_id)
+                                                                       task_id=producer_tasks_list[0].task_id,
+                                                                       origin=origin)
                 if len(cur_task.dependency) != len(
                         task_deps_cur_task) or task_deps_cur_task[0].start_tiles != cur_task.dependency[
                             0].start_tiles or task_deps_cur_task[0].end_tiles != cur_task.dependency[0].end_tiles:

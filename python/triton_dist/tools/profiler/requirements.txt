@@ -1,0 +1,4 @@
+# Dependencies for the critical path exploration tooling.
+# The server relies solely on the Python standard library, but this file
+# is provided to give downstream users a stable anchor for installing any
+# optional extras in the future.

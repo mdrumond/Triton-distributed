@@ -34,11 +34,17 @@ from ..core.registry import registry
 from ..core.task_base import TaskBase, DeviceProp, TaskDependency, TaskIDManager, MAX_NUM_TENSOR_DIMS
 from ..core.builder import TaskBuilderBase
 from ..core.graph import Graph
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from triton_dist.utils import nvshmem_create_tensor, nvshmem_free_tensor_sync
 from ..core.scheduler import enque_tasks
 from triton_dist.models.utils import logger
-from triton_dist.tools.profiler import alloc_profiler_buffer, export_to_perfetto_trace, reset_profiler_buffer, parse_to_tracks
+from triton_dist.tools.profiler import (
+    alloc_profiler_buffer,
+    export_to_perfetto_trace,
+    export_dependency_trace,
+    reset_profiler_buffer,
+    parse_to_tracks,
+)
 
 
 def is_multicast_ptr(tensor):
@@ -150,6 +156,7 @@ class ModelBuilder:
         self.task_types_to_str = None
         self._warned_allreduce_fallback = False
         self._graph = Graph()
+        self._scheduled_tasks = []
 
     def create_symm_tensor(self, shape, dtype) -> torch.Tensor:
         tensor = nvshmem_create_tensor(shape, dtype)
@@ -541,6 +548,7 @@ class ModelBuilder:
 
     def reset(self):
         TaskIDManager.reset_all_ids()
+        self._scheduled_tasks = []
 
     def compile(self):
         self.logger.log(f"num_total_tasks = {len(self.megakernel_tasks)}", level="debug")
@@ -550,6 +558,7 @@ class ModelBuilder:
             megakernel_tasks = self.megakernel_tasks
         self.wq_tensor, self.num_tasks_tensor, self.scoreboard, self.task_deps_tensor = enque_tasks(
             self.device_prop.NUM_SMS, megakernel_tasks, "round_robin")
+        self._scheduled_tasks = list(megakernel_tasks)
         self.scoreboard = torch.zeros((self.max_layer_id + 1, self.max_task_id + 1, self.MAX_NUM_TILES_PER_OP),
                                       dtype=torch.int32, device=torch.cuda.current_device())
 
@@ -572,12 +581,26 @@ class ModelBuilder:
         else:
             self.profile_buf = None
 
-    def dump_trace(self, trace_file_prefix="MEGA_KERNEL_TRACE"):
+    def dump_trace(
+        self,
+        trace_file_prefix: str = "MEGA_KERNEL_TRACE",
+        dependency_trace_base_dir: Optional[str] = None,
+    ):
         if self._enable_profiling:
             profiler_dir = os.environ.get("MEGA_KERNEL_PRODILER_DIR", "./prof")
             os.makedirs(profiler_dir, exist_ok=True)
             trace_file = os.path.join(profiler_dir, f"{trace_file_prefix}_RANK_{self.rank}")
             export_to_perfetto_trace(self.profile_buf, self.task_types_to_str, trace_file)
+            dep_trace_file = os.path.join(profiler_dir, f"{trace_file_prefix}_RANK_{self.rank}_dependencies")
+            export_dependency_trace(
+                profiler_buffer=self.profile_buf,
+                task_types_to_str=self.task_types_to_str,
+                trace_file=dep_trace_file,
+                wq_tensor=self.wq_tensor,
+                num_tasks_tensor=self.num_tasks_tensor,
+                scheduled_tasks=self._scheduled_tasks,
+                base_dir=dependency_trace_base_dir,
+            )
         else:
             self.logger.log("profiler not enabled, please set enable_profiling=True", level="warning")
 

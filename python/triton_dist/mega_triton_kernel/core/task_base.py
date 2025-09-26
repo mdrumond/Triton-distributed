@@ -22,11 +22,50 @@
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #
 ################################################################################
-from typing import Dict, Type, List, Any, Tuple, Union, Optional
+from typing import Dict, Type, List, Any, Tuple, Union, Optional, Set
 from dataclasses import dataclass, field
+import inspect
+import os
+from pathlib import Path
+
 from .config import ConfigBase
 import torch
 from .utils import has_slice_intersection
+
+
+def _detect_repo_root(start_path: Optional[Path] = None) -> Optional[str]:
+    """Best-effort discovery of the Triton-distributed repository root."""
+
+    search_roots = []
+    if start_path is not None:
+        search_roots.append(start_path)
+    module_dir = Path(__file__).resolve().parent
+    search_roots.append(module_dir)
+    cwd = Path.cwd()
+    if cwd not in search_roots:
+        search_roots.append(cwd)
+
+    seen: Set[Path] = set()
+    for root in search_roots:
+        current = root
+        while True:
+            if current in seen:
+                break
+            seen.add(current)
+            git_dir = current / ".git"
+            if git_dir.is_dir():
+                return str(current)
+            if current.parent == current:
+                break
+            current = current.parent
+    return None
+
+
+_DEFAULT_DEP_ORIGIN_BASE = os.environ.get("MEGAKERNEL_DEP_TRACE_BASE") or _detect_repo_root()
+
+
+def get_default_dependency_origin_base() -> Optional[str]:
+    return _DEFAULT_DEP_ORIGIN_BASE
 
 # To satisfy the alignment requirement of tensor data_ptr, MAX_NUM_TENSOR_DIMS must be an even number.
 MAX_NUM_TENSOR_DIMS = 4
@@ -110,17 +149,93 @@ class TaskIDManager:
 
 
 @dataclass
+class DependencyOrigin:
+    filename: str
+    lineno: int
+    function: str
+    code_context: Optional[str] = None
+
+    @classmethod
+    def capture(
+        cls,
+        skip_modules: Tuple[str, ...] = ("task_base.py", "graph.py"),
+        base_dir: Optional[str] = None,
+    ) -> Optional["DependencyOrigin"]:
+        """Capture the first caller frame outside the helper modules.
+
+        Args:
+            skip_modules: File name suffixes that should be skipped when walking the
+                stack so we don't report helper utilities as the origin of the
+                dependency edge.
+            base_dir: Optional directory to which captured paths should be made
+                relative. When provided, the returned ``filename`` is the relative
+                path if possible; otherwise the absolute path is used.
+        """
+
+        frame = inspect.currentframe()
+        if frame is None:
+            return None
+        try:
+            caller = frame.f_back
+            if caller is None:
+                return None
+            target = caller.f_back
+            while target is not None:
+                filename = os.path.abspath(target.f_code.co_filename)
+                if not any(filename.endswith(mod) for mod in skip_modules):
+                    code_line = inspect.getframeinfo(target).code_context
+                    code_context = code_line[0].strip() if code_line else None
+                    if base_dir is not None:
+                        try:
+                            rel_path = os.path.relpath(filename, start=base_dir)
+                            # Avoid introducing ".." prefixes for unrelated paths
+                            if not rel_path.startswith(".."):
+                                filename_to_report = rel_path
+                            else:
+                                filename_to_report = filename
+                        except ValueError:
+                            filename_to_report = filename
+                    else:
+                        filename_to_report = filename
+                    return cls(
+                        filename=filename_to_report,
+                        lineno=target.f_lineno,
+                        function=target.f_code.co_name,
+                        code_context=code_context,
+                    )
+                target = target.f_back
+            return None
+        finally:
+            del frame
+            if "caller" in locals():
+                del caller
+            if "target" in locals():
+                del target
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "filename": self.filename,
+            "lineno": self.lineno,
+            "function": self.function,
+            "code_context": self.code_context,
+        }
+
+
+@dataclass
 class TaskDependency:
     layer_id: int
     task_id: int
     start_tiles: int  # include
     end_tiles: int  # exclude
+    origin: Optional[DependencyOrigin] = None
 
-    def __init__(self, layer_id=-1, task_id=-1, start_tiles=0, end_tiles=0):
+    def __init__(self, layer_id: int = -1, task_id: int = -1, start_tiles: int = 0, end_tiles: int = 0,
+                 origin: Optional[DependencyOrigin] = None):
         self.layer_id = layer_id
         self.task_id = task_id
         self.start_tiles = start_tiles
         self.end_tiles = end_tiles
+        self.origin = origin
 
     def cover(self, other):
         return other.layer_id == self.layer_id and other.task_id == self.task_id and other.start_tiles >= self.start_tiles and other.end_tiles <= self.end_tiles
@@ -146,8 +261,17 @@ class InputDependencyDesc:
     data_sizes: Tuple[int]
     # only require_full == false, start_indices/data_sizes are valid
     require_full: bool = True
+    origin: Optional[DependencyOrigin] = None
 
-    def __init__(self, input, require_full=True, start_indices: Tuple[int] = (), data_sizes: Tuple[int] = ()):
+    def __init__(
+        self,
+        input,
+        require_full: bool = True,
+        start_indices: Tuple[int] = (),
+        data_sizes: Tuple[int] = (),
+        origin: Optional[DependencyOrigin] = None,
+        capture_origin: bool = True,
+    ):
         self.input = input
         self.require_full = require_full
         if require_full:
@@ -156,6 +280,12 @@ class InputDependencyDesc:
         else:
             self.start_indices = start_indices
             self.data_sizes = data_sizes
+        if origin is not None:
+            self.origin = origin
+        elif capture_origin:
+            self.origin = DependencyOrigin.capture(base_dir=_DEFAULT_DEP_ORIGIN_BASE)
+        else:
+            self.origin = None
 
 
 @dataclass
