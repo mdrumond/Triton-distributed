@@ -340,11 +340,29 @@ def ingest_trace(trace_path: Path, conn: sqlite3.Connection) -> None:
 # --------------------------------------------------------------------------------------
 
 
+def _detect_repo_root(start_path: Optional[Path] = None) -> Optional[Path]:
+    """Best-effort detection of the repository root from the current path."""
+
+    if start_path is None:
+        start_path = Path.cwd()
+    try:
+        start_path = start_path.resolve()
+    except OSError:
+        return None
+    if start_path.is_file():
+        start_path = start_path.parent
+    for candidate in (start_path, *start_path.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return None
+
+
 class DependencyTraceService:
     def __init__(self, db_path: Path, trace_path: Path) -> None:
         self._db_path = db_path
         self._trace_path = trace_path
         self._metadata_cache: Optional[Dict[str, Optional[str]]] = None
+        self._repo_root = _detect_repo_root(trace_path.parent)
 
     @contextlib.contextmanager
     def _connection(self):
@@ -383,6 +401,8 @@ class DependencyTraceService:
         base_dir = self.metadata.get("origin_base_dir")
         if base_dir:
             candidates.append(os.path.join(base_dir, filename))
+        if self._repo_root:
+            candidates.append(os.path.join(str(self._repo_root), filename))
         candidates.append(os.path.join(self._trace_path.parent, filename))
         for candidate in candidates:
             if candidate and os.path.exists(candidate):
