@@ -599,6 +599,8 @@ class ModelBuilder:
                 wq_tensor=self.wq_tensor,
                 num_tasks_tensor=self.num_tasks_tensor,
                 scheduled_tasks=self._scheduled_tasks,
+                rank=self.rank,
+                world_size=self.world_size,
                 base_dir=dependency_trace_base_dir,
             )
         else:
